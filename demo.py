@@ -15,7 +15,7 @@ demo.py - gprbf 固定输入演示 (确定性数据, 真实计算, 无网络/无
 import math
 import time
 
-from gprbf import Hyperparameters, log_marginal, predict
+from gprbf import Hyperparameters, log_marginal, predict, predict_joint
 
 Z95 = 1.959963984540054  # 标准正态 0.975 分位, 95% 区间
 
@@ -91,6 +91,62 @@ def main():
         print(f"  ValueError 已捕获: {exc}")
     else:
         raise AssertionError("NaN 输入应当被拒绝")
+    print()
+
+    print("=" * 68)
+    print("联合预测: 函数值观测 + 一维一阶导数观测 (predict_joint)")
+    print("=" * 68)
+    # 解析函数合成: f = sin, f' = cos。函数观测较稀疏, 导数观测只给 4 个点。
+    Xj = [(-2.0 + 0.5 * i,) for i in range(9)]
+    yj = [math.sin(x[0]) for x in Xj]
+    Xdj = [(-1.5,), (-0.5,), (0.5,), (1.5,)]
+    ydj = [math.cos(x[0]) for x in Xdj]
+    hp_j = Hyperparameters(alpha=1.2, lengthscale=0.8, noise=0.05)
+    Xtj = [(-1.8 + 0.3 * i,) for i in range(13)]
+    pj = predict_joint(Xj, yj, Xdj, ydj, Xtj, hp_j, noise_deriv=0.05)
+    p0 = predict(Xj, yj, Xtj, hp_j)
+    assert pj.status == "ok" and p0.status == "ok"
+    print(f"函数观测 n={len(Xj)} (y=sin x), 导数观测 m={len(Xdj)} (yd=cos x), "
+          f"noise_deriv=0.05")
+    print(f"  {'x':>6} | {'sin(x)':>8} | {'joint mean':>10} | {'plain mean':>10} | "
+          f"{'cos(x)':>8} | {'deriv mean':>10}")
+    for t, xt in enumerate(Xtj):
+        print(f"  {xt[0]:6.2f} | {math.sin(xt[0]):8.4f} | {pj.mean[t]:10.4f} | "
+              f"{p0.mean[t]:10.4f} | {math.cos(xt[0]):8.4f} | {pj.deriv_mean[t]:10.4f}")
+    sse_j = sum((m - math.sin(x[0])) ** 2 for m, x in zip(pj.mean, Xtj))
+    sse_0 = sum((m - math.sin(x[0])) ** 2 for m, x in zip(p0.mean, Xtj))
+    sse_d = sum((m - math.cos(x[0])) ** 2 for m, x in zip(pj.deriv_mean, Xtj))
+    print(f"  误差平方和: 联合 {sse_j:.3e} < 纯函数值 {sse_0:.3e}; "
+          f"导数预测对 cos 的误差平方和 {sse_d:.3e}")
+    print(f"  导数观测缩小隐方差: "
+          f"max(latent_plain - latent_joint) = "
+          f"{max(b - a for a, b in zip(pj.latent_variance, p0.latent_variance)):.4f}")
+    print()
+
+    print("[边界触发] 重复导数观测点 + 极小噪声 (noise_deriv=1e-10), 未提供 jitter")
+    Xb, yb = [(0.0,), (1.0,)], [0.5, -0.5]
+    Xd_dup = [(0.5,), (0.5,)]
+    hp_tiny = Hyperparameters(alpha=1.0, lengthscale=1.0, noise=1e-10)
+    bad_j = predict_joint(Xb, yb, Xd_dup, [0.3, 0.3], [(0.5,)],
+                          hp_tiny, noise_deriv=1e-10)
+    print(f"  predict_joint status = {bad_j.status!r} (mean={bad_j.mean}, "
+          f"deriv_mean={bad_j.deriv_mean})")
+    assert bad_j.status == "not_pd"
+    print("  -> 导数-导数协方差块出现重复行, 联合协方差非正定, 模块拒绝给出结果。")
+    fixed_j = predict_joint(Xb, yb, Xd_dup, [0.3, 0.3], [(0.5,)],
+                            hp_tiny, noise_deriv=1e-10, jitter=1e-6)
+    print(f"  显式 jitter=1e-6 后 status = {fixed_j.status!r}, "
+          f"mean = {fixed_j.mean[0]:.6f}, deriv_mean = {fixed_j.deriv_mean[0]:.6f}")
+    print()
+
+    print("[异常触发] 二维输入使用导数观测 (本迭代仅支持一维)")
+    try:
+        predict_joint([(0.0, 1.0), (1.0, 0.0)], [0.0, 1.0], [], [],
+                      [(0.5, 0.5)], hp_j, noise_deriv=0.1)
+    except ValueError as exc:
+        print(f"  ValueError 已捕获: {exc}")
+    else:
+        raise AssertionError("多维导数观测应当被拒绝")
     print()
 
     print(f"演示完成, 实际耗时 {time.perf_counter() - t0:.2f} 秒。")

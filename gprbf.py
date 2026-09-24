@@ -11,6 +11,12 @@ gprbf - 精确 RBF 高斯过程回归（标准库实现，无第三方依赖）�
   * Cholesky 失败时返回 status="not_pd", 绝不自动加未记录的 jitter。
   * 数值输入拒绝 NaN/Infinity; bool 不作为数值接受。
   * 本模块无状态、不修改调用方传入的数据。
+
+一维一阶导数观测 (本次迭代新增, 仅 d=1):
+  predict_joint 把函数值观测 (X, y, 噪声 hp.noise) 与导数观测 (Xd, yd,
+  噪声 noise_deriv) 拼成联合协方差做联合预测, 同时给出测试点处函数与
+  导数的后验。rbf_kernel_df / rbf_kernel_dd 公开函数-导数与导数-导数
+  协方差块, 便于独立审计。
 """
 
 from __future__ import annotations
@@ -27,9 +33,13 @@ __all__ = [
     "Hyperparameters",
     "MarginalResult",
     "Prediction",
+    "JointPrediction",
     "log_marginal",
     "predict",
+    "predict_joint",
     "rbf_kernel",
+    "rbf_kernel_df",
+    "rbf_kernel_dd",
     "classify_raw_variance",
 ]
 
@@ -119,6 +129,49 @@ class Prediction:
     symmetry_residual: float
     solve_residual: Optional[float]
     effective_noise_variance: float
+    jitter: float
+
+
+@dataclass(frozen=True)
+class JointPrediction:
+    """
+    predict_joint 的结果 (函数值观测 + 一维一阶导数观测的联合后验)。
+
+    status:
+        "ok"                - 全部预测点正常 (允许个别点负微量抹零);
+        "not_pd"            - 联合协方差非正定, 预测字段为 None;
+        "negative_variance" - 至少一个点的原始隐方差 (函数或导数) 比
+                              -NEG_VAR_REL_TOL*max(1, 先验方差) 还小,
+                              原样返回负值供定位, 不静默纠正。
+    mean / latent_variance / observed_variance:
+        测试点处函数值 f(x*) 的后验均值、隐方差、观测方差
+        (observed = latent + noise^2 + jitter)。
+    deriv_mean / deriv_latent_variance / deriv_observed_variance:
+        测试点处导数 f'(x*) 的后验均值、隐方差、观测方差
+        (observed = latent + noise_deriv^2 + jitter)。
+    raw_latent_variance / raw_deriv_latent_variance: 未经抹零的原始值。
+    clamped / deriv_clamped: 发生负微量抹零的预测点下标。
+    symmetry_residual: max|C - C^T|, C 为 (n+m) 阶联合协方差。
+    solve_residual: 训练求解与全部测试点求解残差的最大值。
+    effective_noise_variance:        函数值观测实际噪声方差 noise^2 + jitter。
+    effective_deriv_noise_variance:  导数观测实际噪声方差 noise_deriv^2 + jitter。
+    """
+
+    status: str
+    mean: Optional[Tuple[float, ...]]
+    latent_variance: Optional[Tuple[float, ...]]
+    observed_variance: Optional[Tuple[float, ...]]
+    deriv_mean: Optional[Tuple[float, ...]]
+    deriv_latent_variance: Optional[Tuple[float, ...]]
+    deriv_observed_variance: Optional[Tuple[float, ...]]
+    raw_latent_variance: Optional[Tuple[float, ...]]
+    raw_deriv_latent_variance: Optional[Tuple[float, ...]]
+    clamped: Tuple[int, ...]
+    deriv_clamped: Tuple[int, ...]
+    symmetry_residual: float
+    solve_residual: Optional[float]
+    effective_noise_variance: float
+    effective_deriv_noise_variance: float
     jitter: float
 
 
@@ -268,6 +321,96 @@ def _cross_kernel(X_train, X_test, hp: Hyperparameters):
                 d2 += d * d
             Ks[i][t] = a2 * math.exp(-d2 * inv2l2)
     return Ks
+
+
+# ---------------------------------------------------------------------------
+# 一维导数协方差 (仅 d=1; 记 r = x - x', k = k(x, x'), ell = lengthscale)
+#
+#   Cov(f(x), f'(x')) = ∂k/∂x'          = k * r / ell^2
+#   Cov(f'(x), f(x')) = ∂k/∂x           = -k * r / ell^2
+#   Cov(f'(x), f'(x')) = ∂^2 k/∂x∂x'    = k * (1/ell^2 - r^2/ell^4)
+#   Var(f'(x))        = alpha^2 / ell^2          (r = 0 时)
+# ---------------------------------------------------------------------------
+
+
+def _kernel_df_1d(Xf, Xd, hp: Hyperparameters):
+    """Kd[i][j] = Cov(f(Xf[i]), f'(Xd[j])) (输入须已校验为一维)。"""
+    a2 = hp.alpha * hp.alpha
+    ell2 = hp.lengthscale * hp.lengthscale
+    inv2l2 = 1.0 / (2.0 * ell2)
+    out = []
+    for xf in Xf:
+        x = xf[0]
+        row = []
+        for xd in Xd:
+            r = x - xd[0]
+            k = a2 * math.exp(-r * r * inv2l2)
+            row.append(k * r / ell2)
+        out.append(row)
+    return out
+
+
+def _kernel_dd_1d(Xd1, Xd2, hp: Hyperparameters):
+    """Kdd[i][j] = Cov(f'(Xd1[i]), f'(Xd2[j])) (输入须已校验为一维)。"""
+    a2 = hp.alpha * hp.alpha
+    ell2 = hp.lengthscale * hp.lengthscale
+    inv2l2 = 1.0 / (2.0 * ell2)
+    out = []
+    for x1 in Xd1:
+        x = x1[0]
+        row = []
+        for x2 in Xd2:
+            r = x - x2[0]
+            k = a2 * math.exp(-r * r * inv2l2)
+            row.append(k * (1.0 / ell2 - (r * r) / (ell2 * ell2)))
+        out.append(row)
+    return out
+
+
+def _validate_1d(Xv, dim: int, name: str) -> None:
+    if dim != 1:
+        raise ValueError(
+            f"{name}: derivative observations are supported for 1D inputs only, "
+            f"got dimension {dim}"
+        )
+
+
+def rbf_kernel_df(
+    X_f: Sequence[Sequence[float]],
+    X_d: Sequence[Sequence[float]],
+    hp: Hyperparameters,
+) -> Tuple[Tuple[float, ...], ...]:
+    """
+    函数-导数交叉协方差块 (仅一维):
+        返回矩阵第 [i][j] 个元素为 Cov(f(X_f[i]), f'(X_d[j]))
+        = k(X_f[i], X_d[j]) * (X_f[i] - X_d[j]) / lengthscale^2。
+    走完整输入校验, 便于独立使用与审计。
+    """
+    Xf, _, df = _validate_matrix(X_f, "X_f", max_rows=MAX_SAMPLES)
+    Xd, _, dd = _validate_matrix(X_d, "X_d", max_rows=MAX_SAMPLES)
+    _validate_1d(Xf, df, "X_f")
+    _validate_1d(Xd, dd, "X_d")
+    hpv = _validate_hp(hp)
+    return tuple(tuple(row) for row in _kernel_df_1d(Xf, Xd, hpv))
+
+
+def rbf_kernel_dd(
+    X_d1: Sequence[Sequence[float]],
+    X_d2: Sequence[Sequence[float]],
+    hp: Hyperparameters,
+) -> Tuple[Tuple[float, ...], ...]:
+    """
+    导数-导数协方差块 (仅一维):
+        返回矩阵第 [i][j] 个元素为 Cov(f'(X_d1[i]), f'(X_d2[j]))
+        = k(X_d1[i], X_d2[j]) * (1/ell^2 - (X_d1[i]-X_d2[j])^2/ell^4)。
+    走完整输入校验, 便于独立使用与审计。
+    """
+    X1, _, d1 = _validate_matrix(X_d1, "X_d1", max_rows=MAX_SAMPLES)
+    X2, _, d2 = _validate_matrix(X_d2, "X_d2", max_rows=MAX_SAMPLES)
+    _validate_1d(X1, d1, "X_d1")
+    _validate_1d(X2, d2, "X_d2")
+    hpv = _validate_hp(hp)
+    return tuple(tuple(row) for row in _kernel_dd_1d(X1, X2, hpv))
 
 
 def _cholesky(A):
@@ -574,5 +717,240 @@ def predict(
         symmetry_residual=sym,
         solve_residual=solve_res,
         effective_noise_variance=var,
+        jitter=jv,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 一维导数观测的联合预测
+# ---------------------------------------------------------------------------
+
+
+def _validate_noise_deriv(noise_deriv) -> float:
+    v = _finite_float(noise_deriv, "noise_deriv")
+    if v <= 0.0:
+        raise ValueError(f"noise_deriv: must be > 0, got {v!r}")
+    return v
+
+
+def _validate_derivative_observations(Xd, yd):
+    """
+    导数观测 (Xd, yd): 允许同时为空 (表示无导数观测), 非空时为一维点集,
+    长度必须一致。返回 (Xdv, ydv, m)。
+    """
+    if not isinstance(Xd, (list, tuple)):
+        raise TypeError(f"Xd: expected list/tuple of rows, got {type(Xd).__name__}")
+    if not isinstance(yd, (list, tuple)):
+        raise TypeError(f"yd: expected list/tuple, got {type(yd).__name__}")
+    if len(Xd) == 0:
+        if len(yd) != 0:
+            raise ValueError(
+                f"yd: length {len(yd)} != number of derivative observations 0 "
+                "(Xd is empty)"
+            )
+        return (), (), 0
+    Xdv, m, dd = _validate_matrix(Xd, "Xd", max_rows=MAX_SAMPLES)
+    _validate_1d(Xdv, dd, "Xd")
+    ydv = _validate_vector(yd, "yd", m)
+    return Xdv, ydv, m
+
+
+def _joint_covariance_1d(Xv, Xdv, hp: Hyperparameters, var_f: float, var_d: float):
+    """
+    联合协方差 C (阶 n+m), 观测顺序为 [y_1..y_n, yd_1..yd_m]:
+
+        C = [[K_ff + var_f * I_n,  K_fd              ],
+             [K_fd^T,               K_dd + var_d * I_m]]
+
+    分块镜像赋值, 保证逐位对称。
+    """
+    n = len(Xv)
+    m = len(Xdv)
+    N = n + m
+    a2 = hp.alpha * hp.alpha
+    ell2 = hp.lengthscale * hp.lengthscale
+    inv2l2 = 1.0 / (2.0 * ell2)
+    C = [[0.0] * N for _ in range(N)]
+    for i in range(n):
+        xi = Xv[i][0]
+        for j in range(i, n):
+            r = xi - Xv[j][0]
+            k = a2 * math.exp(-r * r * inv2l2)
+            C[i][j] = k
+            C[j][i] = k  # 同一表达式镜像赋值, 保证逐位对称
+    for i in range(n):
+        xi = Xv[i][0]
+        for j in range(m):
+            r = xi - Xdv[j][0]
+            k = a2 * math.exp(-r * r * inv2l2)
+            v = k * r / ell2
+            C[i][n + j] = v
+            C[n + j][i] = v
+    for i in range(m):
+        xi = Xdv[i][0]
+        for j in range(i, m):
+            r = xi - Xdv[j][0]
+            k = a2 * math.exp(-r * r * inv2l2)
+            v = k * (1.0 / ell2 - (r * r) / (ell2 * ell2))
+            C[n + i][n + j] = v
+            C[n + j][n + i] = v
+    for i in range(n):
+        C[i][i] += var_f
+    for j in range(m):
+        C[n + j][n + j] += var_d
+    return C
+
+
+def predict_joint(
+    X: Sequence[Sequence[float]],
+    y: Sequence[float],
+    Xd: Sequence[Sequence[float]],
+    yd: Sequence[float],
+    X_test: Sequence[Sequence[float]],
+    hp: Hyperparameters,
+    *,
+    noise_deriv: float,
+    jitter: float = 0.0,
+) -> JointPrediction:
+    """
+    函数值观测 + 一维一阶导数观测的联合 GP 后验预测 (仅 d=1)。
+
+    观测向量 z = [y (n 个函数值, 噪声 hp.noise), yd (m 个导数值, 噪声
+    noise_deriv)], 联合协方差见 _joint_covariance_1d。对每个测试点 x*:
+
+        mean_f  = k_*^T C^-1 z,      latent_f  = alpha^2 - k_*^T C^-1 k_*
+        mean_d  = kd_*^T C^-1 z,     latent_d  = alpha^2/ell^2 - kd_*^T C^-1 kd_*
+
+    其中 k_* 为 Cov(z, f(x*)), kd_* 为 Cov(z, f'(x*))。观测方差分别在隐方差
+    上加 noise^2 + jitter 与 noise_deriv^2 + jitter。
+
+    Xd/yd 可同时为空列表 (退化为纯函数值观测, 结果与 predict 一致);
+    noise_deriv 为必填关键字参数 (即使 m=0 也会校验, 不提供默认值)。
+    联合观测总数 n + m <= MAX_SAMPLES。负微量抹零策略与 predict 相同,
+    导数方差的容差按先验方差 alpha^2/ell^2 缩放。
+    """
+    Xv, n, d = _validate_matrix(X, "X", max_rows=MAX_SAMPLES)
+    _validate_1d(Xv, d, "X")
+    yv = _validate_vector(y, "y", n)
+    Xdv, ydv, m = _validate_derivative_observations(Xd, yd)
+    if n + m > MAX_SAMPLES:
+        raise ValueError(
+            f"X/Xd: total observations {n + m} exceeds limit {MAX_SAMPLES}"
+        )
+    hpv = _validate_hp(hp)
+    sd = _validate_noise_deriv(noise_deriv)
+    jv = _validate_jitter(jitter)
+    Xt, _mt, dt = _validate_matrix(X_test, "X_test", max_rows=MAX_TEST_POINTS)
+    _validate_1d(Xt, dt, "X_test")
+
+    var_f = hpv.noise * hpv.noise + jv
+    var_d = sd * sd + jv
+
+    C = _joint_covariance_1d(Xv, Xdv, hpv, var_f, var_d)
+    sym = _symmetry_residual(C)
+    L = _cholesky(C)
+    if L is None:
+        return JointPrediction(
+            status="not_pd",
+            mean=None,
+            latent_variance=None,
+            observed_variance=None,
+            deriv_mean=None,
+            deriv_latent_variance=None,
+            deriv_observed_variance=None,
+            raw_latent_variance=None,
+            raw_deriv_latent_variance=None,
+            clamped=(),
+            deriv_clamped=(),
+            symmetry_residual=sym,
+            solve_residual=None,
+            effective_noise_variance=var_f,
+            effective_deriv_noise_variance=var_d,
+            jitter=jv,
+        )
+
+    z = list(yv) + list(ydv)
+    avec = _cho_solve(L, z)
+    solve_res = _max_abs([q - z[i] for i, q in enumerate(_matvec(C, avec))])
+
+    a2 = hpv.alpha * hpv.alpha
+    ell2 = hpv.lengthscale * hp.lengthscale
+    inv2l2 = 1.0 / (2.0 * ell2)
+    prior_var_d = a2 / ell2
+    N = n + m
+
+    mt = len(Xt)
+    mean_f = [0.0] * mt
+    raw_f = [0.0] * mt
+    lat_f = [0.0] * mt
+    obs_f = [0.0] * mt
+    mean_d = [0.0] * mt
+    raw_d = [0.0] * mt
+    lat_d = [0.0] * mt
+    obs_d = [0.0] * mt
+    clamped_f = []
+    clamped_d = []
+    hard_negative = False
+
+    for t in range(mt):
+        xs = Xt[t][0]
+        kv = [0.0] * N  # Cov(z_a, f(x*))
+        kd = [0.0] * N  # Cov(z_a, f'(x*))
+        for i in range(n):
+            r = Xv[i][0] - xs
+            k = a2 * math.exp(-r * r * inv2l2)
+            kv[i] = k
+            kd[i] = k * r / ell2
+        for j in range(m):
+            r = Xdv[j][0] - xs
+            k = a2 * math.exp(-r * r * inv2l2)
+            kv[n + j] = -k * r / ell2
+            kd[n + j] = k * (1.0 / ell2 - (r * r) / (ell2 * ell2))
+
+        w = _cho_solve(L, kv)
+        u = _cho_solve(L, kd)
+        mean_f[t] = sum(kv[i] * avec[i] for i in range(N))
+        mean_d[t] = sum(kd[i] * avec[i] for i in range(N))
+        rf = a2 - sum(kv[i] * w[i] for i in range(N))
+        rd = prior_var_d - sum(kd[i] * u[i] for i in range(N))
+        raw_f[t] = rf
+        raw_d[t] = rd
+
+        r1 = _max_abs([q - kv[i] for i, q in enumerate(_matvec(C, w))])
+        r2 = _max_abs([q - kd[i] for i, q in enumerate(_matvec(C, u))])
+        solve_res = max(solve_res, r1, r2)
+
+        vf, kind_f = classify_raw_variance(rf, a2)
+        vd, kind_d = classify_raw_variance(rd, prior_var_d)
+        lat_f[t] = vf
+        obs_f[t] = vf + var_f
+        lat_d[t] = vd
+        obs_d[t] = vd + var_d
+        if kind_f == "clamped":
+            clamped_f.append(t)
+        elif kind_f == "negative":
+            hard_negative = True
+        if kind_d == "clamped":
+            clamped_d.append(t)
+        elif kind_d == "negative":
+            hard_negative = True
+
+    status = "negative_variance" if hard_negative else "ok"
+    return JointPrediction(
+        status=status,
+        mean=tuple(mean_f),
+        latent_variance=tuple(lat_f),
+        observed_variance=tuple(obs_f),
+        deriv_mean=tuple(mean_d),
+        deriv_latent_variance=tuple(lat_d),
+        deriv_observed_variance=tuple(obs_d),
+        raw_latent_variance=tuple(raw_f),
+        raw_deriv_latent_variance=tuple(raw_d),
+        clamped=tuple(clamped_f),
+        deriv_clamped=tuple(clamped_d),
+        symmetry_residual=sym,
+        solve_residual=solve_res,
+        effective_noise_variance=var_f,
+        effective_deriv_noise_variance=var_d,
         jitter=jv,
     )
