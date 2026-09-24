@@ -7,7 +7,14 @@ import math
 import unittest
 
 import gprbf
-from gprbf import Hyperparameters, log_marginal, predict, rbf_kernel
+from gprbf import (
+    Hyperparameters,
+    log_marginal,
+    predict,
+    predict_with_derivatives,
+    rbf_kernel,
+    rbf_kernel_derivatives_1d,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +118,80 @@ def ref_predict_one(X, y, xt, a, ell, s, jitter=0.0):
     mean = sum(ks[i] * ai[i] for i in range(n))
     latent = a * a - sum(ks[i] * sum(Inv[i][j] * ks[j] for j in range(n)) for i in range(n))
     return mean, latent, latent + var
+
+
+# ---------------------------------------------------------------------------
+# 独立的一维函数/导数核参考 (在本文件内另行推导编写, 不调用 gprbf)
+# u = x - z:
+#   Cov(f(x), f'(z))  = k * u / ell^2
+#   Cov(f'(x), f'(z)) = k * (1/ell^2 - u^2/ell^4)
+# ---------------------------------------------------------------------------
+
+
+def ref_deriv_blocks(X1, X2, a, ell):
+    """返回 (K, Kf_fd=k 对第二点导数, Kdd), 全部用独立标量循环写出。"""
+    l2 = ell * ell
+    K0, G, H = [], [], []
+    for row_x in X1:
+        x = row_x[0]
+        r0, rg, rh = [], [], []
+        for row_z in X2:
+            z = row_z[0]
+            u = x - z
+            kv = a * a * math.exp(-u * u / (2.0 * l2))
+            r0.append(kv)
+            rg.append(kv * u / l2)                    # d/dz k = +k u/l2
+            rh.append(kv * (1.0 / l2 - u * u / l2 ** 2))
+        K0.append(r0)
+        G.append(rg)
+        H.append(rh)
+    return K0, G, H
+
+
+def ref_joint_predict(Xf, yf, Xd, dy, T, a, ell, s, sd, jitter=0.0):
+    """
+    函数值+导数联合 GP 的独立参考: 直接拼联合协方差, Gauss-Jordan 显式逆,
+    返回逐点 [(f_mean, f_latent, d_mean, d_latent), ...]。
+    """
+    nf, nd = len(Xf), len(Xd)
+    N = nf + nd
+    Kff = ref_rbf_matrix(Xf, Xf, a, ell)
+    Kdd = ref_deriv_blocks(Xd, Xd, a, ell)[2]
+    Kfd = ref_deriv_blocks(Xf, Xd, a, ell)[1]   # Cov(f(Xf), f'(Xd))
+    A = [[0.0] * N for _ in range(N)]
+    vf, vd = s * s + jitter, sd * sd + jitter
+    for i in range(nf):
+        for j in range(nf):
+            A[i][j] = Kff[i][j]
+        A[i][i] += vf
+    for i in range(nd):
+        for j in range(nd):
+            A[nf + i][nf + j] = Kdd[i][j]
+        A[nf + i][nf + i] += vd
+    for i in range(nf):
+        for j in range(nd):
+            A[i][nf + j] = Kfd[i][j]
+            A[nf + j][i] = Kfd[i][j]
+    Inv = ref_inverse(A)
+    obs = list(yf) + list(dy)
+    a_vec = [sum(Inv[i][j] * obs[j] for j in range(N)) for i in range(N)]
+
+    Kf_T = ref_rbf_matrix(Xf, T, a, ell)
+    Gf_T = ref_deriv_blocks(Xf, T, a, ell)[1]   # Cov(f(Xf), f'(T))
+    Gd_T = ref_deriv_blocks(Xd, T, a, ell)[1]   # Cov(f(Xd), f'(T))
+    Hd_T = ref_deriv_blocks(Xd, T, a, ell)[2]   # Cov(f'(Xd), f'(T))
+    Kd_T = ref_deriv_blocks(Xd, T, a, ell)[0]
+    prior_d = a * a / (ell * ell)
+    out = []
+    for t, xt in enumerate(T):
+        kf = [Kf_T[i][t] for i in range(nf)] + [-Gd_T[i][t] for i in range(nd)]
+        kd = [Gf_T[i][t] for i in range(nf)] + [Hd_T[i][t] for i in range(nd)]
+        fm = sum(kf[i] * a_vec[i] for i in range(N))
+        dm = sum(kd[i] * a_vec[i] for i in range(N))
+        fl = a * a - sum(kf[i] * sum(Inv[i][j] * kf[j] for j in range(N)) for i in range(N))
+        dl = prior_d - sum(kd[i] * sum(Inv[i][j] * kd[j] for j in range(N)) for i in range(N))
+        out.append((fm, fl, dm, dl))
+    return out, Kd_T
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +578,483 @@ class TestDeterminismAndImmutability(unittest.TestCase):
             [float(v) for v in y], 1.0, 1.0, 0.1,
         )
         self.assertAlmostEqual(res.log_marginal, ref_lml, delta=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# 一维函数值 + 一阶导数联合 GP 的测试
+# ---------------------------------------------------------------------------
+
+
+def make_deriv_data():
+    # f(x) = sin(x) + 0.15 x,  f'(x) = cos(x) + 0.15, 确定性 1D 数据
+    Xf = [(-2.0 + 0.5 * i,) for i in range(9)]          # -2 .. 2, 9 点
+    yf = [math.sin(x[0]) + 0.15 * x[0] for x in Xf]
+    Xd = [(-1.5,), (-0.5,), (0.5,), (1.5,)]
+    dy = [math.cos(x[0]) + 0.15 for x in Xd]
+    T = [(-1.8,), (-0.95,), (0.0,), (0.95,), (1.8,)]
+    return Xf, yf, Xd, dy, T
+
+
+DHP = Hyperparameters(alpha=1.3, lengthscale=0.9, noise=0.2)
+DSD = 0.15
+
+
+class TestDerivativeKernels(unittest.TestCase):
+    def test_blocks_match_independent_reference(self):
+        X = [(0.3,), (1.1,), (-0.7,)]
+        Z = [(-0.2,), (0.75,), (1.4,), (0.3,)]
+        K, G, H = rbf_kernel_derivatives_1d(X, Z, DHP)
+        rK, rG, rH = ref_deriv_blocks(
+            X, Z, DHP.alpha, DHP.lengthscale
+        )
+        for i in range(len(X)):
+            for j in range(len(Z)):
+                self.assertAlmostEqual(K[i][j], rK[i][j], delta=1e-14)
+                self.assertAlmostEqual(G[i][j], rG[i][j], delta=1e-14)
+                self.assertAlmostEqual(H[i][j], rH[i][j], delta=1e-14)
+
+    def test_blocks_vs_central_differences_signs(self):
+        # 期望值由核标量函数中心差分独立给出:
+        #   G = d/dz k;  d/dx k = -G;  H = d^2/(dx dz) k
+        a, ell = DHP.alpha, DHP.lengthscale
+        X = [(0.3,), (1.1,)]
+        Z = [(-0.2,), (0.75,), (1.4,)]
+        K, G, H = rbf_kernel_derivatives_1d(X, Z, DHP)
+        h = 1e-4  # 二阶混合差分在 h 更小时相消误差增大, 1e-4 处截断/舍入平衡
+        xs = [r[0] for r in X]
+        zs = [r[0] for r in Z]
+        for i, x in enumerate(xs):
+            for j, z in enumerate(zs):
+                d_dz = (ref_rbf_matrix([(x,)], [(z + h,)], a, ell)[0][0]
+                        - ref_rbf_matrix([(x,)], [(z - h,)], a, ell)[0][0]) / (2 * h)
+                d_dx = (ref_rbf_matrix([(x + h,)], [(z,)], a, ell)[0][0]
+                        - ref_rbf_matrix([(x - h,)], [(z,)], a, ell)[0][0]) / (2 * h)
+                d2 = (
+                    ref_rbf_matrix([(x + h,)], [(z + h,)], a, ell)[0][0]
+                    - ref_rbf_matrix([(x + h,)], [(z - h,)], a, ell)[0][0]
+                    - ref_rbf_matrix([(x - h,)], [(z + h,)], a, ell)[0][0]
+                    + ref_rbf_matrix([(x - h,)], [(z - h,)], a, ell)[0][0]
+                ) / (4 * h * h)
+                self.assertAlmostEqual(G[i][j], d_dz, delta=1e-7, msg="d/dz sign")
+                self.assertAlmostEqual(-G[i][j], d_dx, delta=1e-7, msg="d/dx sign")
+                self.assertAlmostEqual(H[i][j], d2, delta=1e-6, msg="d2/dxdz")
+
+    def test_exact_values_and_diagonal_identities(self):
+        # 手算: x=z 时 u=0 => G=0, H = alpha^2/ell^2 = K/ell^2
+        a, ell = 1.3, 0.9
+        X = [(0.0,)]
+        _, G, H = rbf_kernel_derivatives_1d(X, X, DHP)
+        self.assertEqual(G[0][0], 0.0)
+        self.assertAlmostEqual(H[0][0], a * a / (ell * ell), delta=1e-14)
+
+        # 手算单点: x=1, z=0, ell=1, alpha=1 => k=e^-1/2
+        #   G =  k * 1      = e^-1/2
+        #   H =  k * (1-1)  = 0
+        hp1 = Hyperparameters(1.0, 1.0, 0.1)
+        K, G, H = rbf_kernel_derivatives_1d([(1.0,)], [(0.0,)], hp1)
+        e = math.exp(-0.5)
+        self.assertAlmostEqual(K[0][0], e, delta=1e-15)
+        self.assertAlmostEqual(G[0][0], e, delta=1e-15)
+        self.assertEqual(H[0][0], 0.0)
+
+    def test_symmetry_and_antisymmetry(self):
+        X = [(0.3,), (1.1,), (-0.7,)]
+        Z = [(-0.2,), (0.75,)]
+        _, G, H = rbf_kernel_derivatives_1d(X, Z, DHP)
+        _, Gt, Ht = rbf_kernel_derivatives_1d(Z, X, DHP)
+        # Cov(f(x), f'(z)) 交换两点反号; Cov(f'(x), f'(z)) 交换对称
+        for i in range(len(X)):
+            for j in range(len(Z)):
+                self.assertEqual(G[i][j], -Gt[j][i])
+                self.assertEqual(H[i][j], Ht[j][i])
+        # 方阵: G 反对称 (对角 0), H 对称, H 对角为正先验导数方差
+        _, Gs, Hs = rbf_kernel_derivatives_1d(X, X, DHP)
+        n = len(X)
+        for i in range(n):
+            self.assertEqual(Gs[i][i], 0.0)
+            self.assertGreater(Hs[i][i], 0.0)
+            for j in range(n):
+                self.assertEqual(Gs[i][j], -Gs[j][i])
+                self.assertEqual(Hs[i][j], Hs[j][i])
+
+
+class TestJointPrediction(unittest.TestCase):
+    def test_joint_predict_matches_explicit_inverse(self):
+        Xf, yf, Xd, dy, T = make_deriv_data()
+        res = predict_with_derivatives(
+            Xf, yf, Xd, dy, T, DHP, derivative_noise=DSD
+        )
+        self.assertEqual(res.status, "ok")
+        ref, _ = ref_joint_predict(
+            Xf, yf, Xd, dy, T,
+            DHP.alpha, DHP.lengthscale, DHP.noise, DSD,
+        )
+        prior_d = DHP.alpha ** 2 / DHP.lengthscale ** 2
+        for t in range(len(T)):
+            fm, fl, dm, dl = ref[t]
+            self.assertAlmostEqual(res.function_mean[t], fm, delta=1e-11)
+            self.assertAlmostEqual(res.derivative_mean[t], dm, delta=1e-11)
+            self.assertAlmostEqual(res.function_latent_variance[t], fl, delta=1e-10)
+            self.assertAlmostEqual(res.derivative_latent_variance[t], dl, delta=1e-10)
+            self.assertGreaterEqual(res.function_latent_variance[t], 0.0)
+            self.assertGreaterEqual(res.derivative_latent_variance[t], 0.0)
+            # 观测方差 = 隐方差 + 各自噪声方差 (两种噪声相互独立)
+            self.assertAlmostEqual(
+                res.function_observed_variance[t]
+                - res.function_latent_variance[t],
+                DHP.noise ** 2, delta=1e-14,
+            )
+            self.assertAlmostEqual(
+                res.derivative_observed_variance[t]
+                - res.derivative_latent_variance[t],
+                DSD ** 2, delta=1e-14,
+            )
+            self.assertLessEqual(res.function_latent_variance[t], DHP.alpha ** 2 + 1e-12)
+            self.assertLessEqual(res.derivative_latent_variance[t], prior_d + 1e-12)
+        self.assertEqual(res.symmetry_residual, 0.0)
+        self.assertLess(res.solve_residual, 1e-12)
+        self.assertEqual(res.clamped_function, ())
+        self.assertEqual(res.clamped_derivative, ())
+
+    def test_derivative_of_posterior_mean_equals_posterior_derivative(self):
+        # 解析恒等式 (符号端到端核对): d/dx E[f*|data] = E[f'*|data]
+        # 用后验函数均值的中心差分独立核对导数后验均值。
+        Xf, yf, Xd, dy, _ = make_deriv_data()
+        probes = [-1.3, -0.4, 0.27, 0.8, 1.42]
+        h = 1e-5
+        for x0 in probes:
+            rp = predict_with_derivatives(
+                Xf, yf, Xd, dy, [(x0 - h,), (x0,), (x0 + h,)],
+                DHP, derivative_noise=DSD,
+            )
+            self.assertEqual(rp.status, "ok")
+            slope = (rp.function_mean[2] - rp.function_mean[0]) / (2 * h)
+            self.assertAlmostEqual(
+                slope, rp.derivative_mean[1], delta=2e-6,
+                msg=f"posterior mean slope mismatch at {x0}",
+            )
+
+    def test_derivative_observation_interpolation(self):
+        # 导数噪声很小时, 导数观测点处的后验导数应贴近观测值
+        Xf = [(-2.0 + 0.5 * i,) for i in range(9)]
+        yf = [math.sin(x[0]) + 0.15 * x[0] for x in Xf]
+        Xd = [(-1.5,), (0.0,), (1.5,)]
+        dy = [math.cos(x[0]) + 0.15 for x in Xd]
+        res = predict_with_derivatives(
+            Xf, yf, Xd, dy, Xd, DHP, derivative_noise=1e-5
+        )
+        self.assertEqual(res.status, "ok")
+        for j in range(3):
+            self.assertAlmostEqual(res.derivative_mean[j], dy[j], delta=1e-3)
+            self.assertLess(res.derivative_latent_variance[j], 1e-4)
+
+    def test_recovers_true_function_derivative_better_than_noise_free_prior(self):
+        # 正常结果核对: 后验导数均值在网格内逼近解析导数, 误差远小于先验 sd
+        Xf, yf, Xd, dy, T = make_deriv_data()
+        res = predict_with_derivatives(
+            Xf, yf, Xd, dy, T, DHP, derivative_noise=DSD
+        )
+        prior_d_sd = DHP.alpha / DHP.lengthscale
+        for t, xt in enumerate(T):
+            truth = math.cos(xt[0]) + 0.15
+            self.assertLess(abs(res.derivative_mean[t] - truth), 0.05)
+        self.assertLess(
+            max(res.derivative_latent_variance) ** 0.5, 0.5 * prior_d_sd
+        )
+
+    def test_infinite_derivative_noise_matches_function_only_predict(self):
+        # sd_d -> inf 时导数观测被完全忽略, 联合后验的 f 分量必须与旧入口
+        # predict 的结果一致 (独立入口交叉核对)。
+        Xf, yf, Xd, dy, T = make_deriv_data()
+        res = predict_with_derivatives(
+            Xf, yf, Xd, dy, T, DHP, derivative_noise=1e6
+        )
+        self.assertEqual(res.status, "ok")
+        old = predict(Xf, yf, T, DHP)
+        self.assertEqual(old.status, "ok")
+        for t in range(len(T)):
+            self.assertAlmostEqual(
+                res.function_mean[t], old.mean[t], delta=1e-9
+            )
+            self.assertAlmostEqual(
+                res.function_latent_variance[t],
+                old.latent_variance[t], delta=1e-9,
+            )
+
+    def test_jitter_enters_both_diagonal_blocks(self):
+        Xf, yf, Xd, dy, T = make_deriv_data()
+        j = 1e-3
+        res = predict_with_derivatives(
+            Xf, yf, Xd, dy, T, DHP, derivative_noise=DSD, jitter=j
+        )
+        self.assertEqual(res.status, "ok")
+        self.assertAlmostEqual(
+            res.effective_function_noise_variance, DHP.noise ** 2 + j, delta=1e-15
+        )
+        self.assertAlmostEqual(
+            res.effective_derivative_noise_variance, DSD ** 2 + j, delta=1e-15
+        )
+        for t in range(len(T)):
+            self.assertAlmostEqual(
+                res.function_observed_variance[t]
+                - res.function_latent_variance[t],
+                DHP.noise ** 2 + j, delta=1e-14,
+            )
+            self.assertAlmostEqual(
+                res.derivative_observed_variance[t]
+                - res.derivative_latent_variance[t],
+                DSD ** 2 + j, delta=1e-14,
+            )
+
+    def test_prior_variance_far_from_data(self):
+        # 边界: 预测点远离全部观测 => 后验退化回先验
+        # V[f*] = alpha^2, V[f'*] = alpha^2/ell^2, 均值 ~ 0
+        Xf, yf, Xd, dy, _ = make_deriv_data()
+        T = [(100.0,), (-80.0,)]
+        res = predict_with_derivatives(
+            Xf, yf, Xd, dy, T, DHP, derivative_noise=DSD
+        )
+        self.assertEqual(res.status, "ok")
+        a2 = DHP.alpha ** 2
+        for t in range(2):
+            self.assertAlmostEqual(res.function_mean[t], 0.0, delta=1e-12)
+            self.assertAlmostEqual(res.derivative_mean[t], 0.0, delta=1e-12)
+            self.assertAlmostEqual(res.function_latent_variance[t], a2, delta=1e-10)
+            self.assertAlmostEqual(
+                res.derivative_latent_variance[t], a2 / DHP.lengthscale ** 2,
+                delta=1e-10,
+            )
+
+    def test_minimal_one_plus_one_observations(self):
+        # 边界: 最小构型 1 个函数观测 + 1 个导数观测, 与显式逆参考一致
+        Xf, yf = [(0.3,)], [0.8]
+        Xd, dy = [(-0.4,)], [-0.2]
+        T = [(0.0,), (0.7,)]
+        res = predict_with_derivatives(
+            Xf, yf, Xd, dy, T, DHP, derivative_noise=0.1
+        )
+        self.assertEqual(res.status, "ok")
+        ref, _ = ref_joint_predict(
+            Xf, yf, Xd, dy, T, DHP.alpha, DHP.lengthscale, DHP.noise, 0.1
+        )
+        for t in range(2):
+            fm, fl, dm, dl = ref[t]
+            self.assertAlmostEqual(res.function_mean[t], fm, delta=1e-12)
+            self.assertAlmostEqual(res.derivative_mean[t], dm, delta=1e-12)
+            self.assertAlmostEqual(res.function_latent_variance[t], fl, delta=1e-11)
+            self.assertAlmostEqual(res.derivative_latent_variance[t], dl, delta=1e-11)
+
+
+class TestJointEdgeAndFailure(unittest.TestCase):
+    def test_duplicate_derivative_points_tiny_noise_not_pd(self):
+        # 重复导数观测 + 极小导数噪声 => 导数块秩亏, 联合协方差非正定
+        Xf = [(-1.0,), (1.0,)]
+        yf = [0.0, 0.0]
+        Xd = [(0.0,), (0.0,), (0.5,), (0.5,)]
+        dy = [0.3, 0.3, -0.3, -0.3]
+        hp = Hyperparameters(1.0, 1.0, 1e-4)
+        res = predict_with_derivatives(
+            Xf, yf, Xd, dy, [(0.2,)], hp, derivative_noise=1e-10
+        )
+        self.assertEqual(res.status, "not_pd")
+        self.assertIsNone(res.function_mean)
+        self.assertIsNone(res.derivative_mean)
+        self.assertIsNone(res.function_latent_variance)
+        # 显式 jitter 恢复
+        fixed = predict_with_derivatives(
+            Xf, yf, Xd, dy, [(0.2,)], hp,
+            derivative_noise=1e-10, jitter=1e-6,
+        )
+        self.assertEqual(fixed.status, "ok")
+        self.assertTrue(math.isfinite(fixed.function_mean[0]))
+        self.assertTrue(math.isfinite(fixed.derivative_mean[0]))
+
+    def test_status_mapping_under_tiny_derivative_noises(self):
+        # 小规模枚举: 状态机只可能返回三种已文档化状态; raw 与输出一致
+        Xf = [(0.0,)]
+        yf = [0.2]
+        Xd = [(1.0,), (1.0,), (1.0,)]
+        dy = [-0.2, -0.2, -0.2]
+        seen = set()
+        for sd_ in (1e-7, 1e-8, 1e-9, 1e-10, 1e-11, 1e-12):
+            p = predict_with_derivatives(
+                Xf, yf, Xd, dy, [(0.0,), (1.0,)],
+                Hyperparameters(1.0, 1.0, 0.05), derivative_noise=sd_,
+            )
+            self.assertIn(p.status, ("ok", "not_pd", "negative_variance"))
+            seen.add(p.status)
+            if p.status == "not_pd":
+                continue
+            for t in range(2):
+                for raw, lat, clamped in (
+                    (p.raw_function_variance[t], p.function_latent_variance[t],
+                     t in p.clamped_function),
+                    (p.raw_derivative_variance[t], p.derivative_latent_variance[t],
+                     t in p.clamped_derivative),
+                ):
+                    if raw >= 0.0:
+                        self.assertEqual(lat, raw)
+                    elif clamped:
+                        self.assertEqual(lat, 0.0)
+                    else:
+                        self.assertEqual(p.status, "negative_variance")
+                        self.assertEqual(lat, raw)
+        self.assertTrue(seen & {"ok", "not_pd"})
+
+    def test_derivative_observations_reuse_allowed(self):
+        # 同一点位同时作为函数观测与导数观测是合法的 (不同随机量)
+        X = [(-1.0,), (0.0,), (1.0,)]
+        y = [0.5, 0.0, -0.5]
+        dy = [-0.1, 0.2, -0.1]
+        res = predict_with_derivatives(
+            X, y, X, dy, [(0.5,)], DHP, derivative_noise=0.1
+        )
+        self.assertEqual(res.status, "ok")
+        self.assertEqual(res.symmetry_residual, 0.0)
+
+    def test_only_1d_supported(self):
+        Xf = [(0.0, 0.0), (1.0, 0.0)]
+        yf = [0.0, 1.0]
+        Xd = [(0.5,)]
+        dy = [0.1]
+        with self.assertRaisesRegex(ValueError, "1D only"):
+            predict_with_derivatives(
+                Xf, yf, Xd, dy, [(0.0,)], DHP, derivative_noise=0.1
+            )
+        Xf2 = [(0.0,), (1.0,)]
+        Xd2 = [(0.5, 0.5)]
+        with self.assertRaisesRegex(ValueError, "1D only"):
+            predict_with_derivatives(
+                Xf2, yf, Xd2, [0.1], [(0.0,)], DHP, derivative_noise=0.1
+            )
+        with self.assertRaisesRegex(ValueError, "dimension"):
+            predict_with_derivatives(
+                Xf2, yf, Xd, dy, [(0.0, 0.0)], DHP, derivative_noise=0.1
+            )
+
+    def test_kernel_helper_requires_1d(self):
+        with self.assertRaisesRegex(ValueError, "1D only"):
+            rbf_kernel_derivatives_1d(
+                [(0.0, 0.0)], [(0.0, 0.0)], DHP
+            )
+
+    def test_empty_and_length_mismatch(self):
+        Xf, yf, Xd, dy, _ = make_deriv_data()
+        with self.assertRaises(ValueError):
+            predict_with_derivatives(
+                [], [], Xd, dy, [(0.0,)], DHP, derivative_noise=0.1
+            )
+        with self.assertRaises(ValueError):
+            predict_with_derivatives(
+                Xf, yf, [], [], [(0.0,)], DHP, derivative_noise=0.1
+            )
+        with self.assertRaisesRegex(ValueError, "dy"):
+            predict_with_derivatives(
+                Xf, yf, Xd, dy[:-1], [(0.0,)], DHP, derivative_noise=0.1
+            )
+        with self.assertRaisesRegex(ValueError, "y"):
+            predict_with_derivatives(
+                Xf, yf[:-1], Xd, dy, [(0.0,)], DHP, derivative_noise=0.1
+            )
+
+    def test_total_observation_limit(self):
+        # 函数+导数合计上限 80
+        Xf = [(float(i) * 0.1,) for i in range(40)]
+        yf = [0.0] * 40
+        Xd = [(float(i) * 0.1 + 0.05,) for i in range(41)]
+        dy = [0.0] * 41
+        with self.assertRaisesRegex(ValueError, "exceeds limit 80"):
+            predict_with_derivatives(
+                Xf, yf, Xd, dy, [(0.0,)], DHP, derivative_noise=0.1
+            )
+        # 合计恰为 80 合法
+        res = predict_with_derivatives(
+            Xf, yf, Xd[:40], dy[:40], [(0.0,)], DHP, derivative_noise=0.1
+        )
+        self.assertEqual(res.status, "ok")
+
+    def test_derivative_noise_validation(self):
+        Xf, yf, Xd, dy, _ = make_deriv_data()
+        for bad in (0.0, -0.1, float("nan"), float("inf")):
+            with self.assertRaises((ValueError, TypeError)):
+                predict_with_derivatives(
+                    Xf, yf, Xd, dy, [(0.0,)], DHP, derivative_noise=bad
+                )
+        with self.assertRaises(TypeError):
+            predict_with_derivatives(
+                Xf, yf, Xd, dy, [(0.0,)], DHP, derivative_noise=True  # noqa
+            )
+        with self.assertRaisesRegex(ValueError, "jitter"):
+            predict_with_derivatives(
+                Xf, yf, Xd, dy, [(0.0,)], DHP,
+                derivative_noise=0.1, jitter=-1e-9,
+            )
+
+    def test_nan_in_derivative_observations_rejected(self):
+        Xf, yf, Xd, dy, _ = make_deriv_data()
+        bad_dy = list(dy)
+        bad_dy[1] = float("nan")
+        with self.assertRaisesRegex(ValueError, "dy\\[1\\]"):
+            predict_with_derivatives(
+                Xf, yf, Xd, bad_dy, [(0.0,)], DHP, derivative_noise=0.1
+            )
+        bad_Xd = [list(v) for v in Xd]
+        bad_Xd[2] = (float("inf"),)
+        with self.assertRaisesRegex(ValueError, "Xd\\[2\\]\\[0\\]"):
+            predict_with_derivatives(
+                Xf, yf, bad_Xd, dy, [(0.0,)], DHP, derivative_noise=0.1
+            )
+
+    def test_integer_derivative_inputs_accepted(self):
+        Xf = [(0,), (1,), (2,)]
+        yf = [1, -1, 0]
+        Xd = [(0,), (2,)]
+        dy = [0, 1]
+        res = predict_with_derivatives(
+            Xf, yf, Xd, dy, [(1,)], Hyperparameters(1, 1, 0.1),
+            derivative_noise=0.1,
+        )
+        self.assertEqual(res.status, "ok")
+        ref, _ = ref_joint_predict(
+            [(float(r[0]),) for r in Xf], [float(v) for v in yf],
+            [(float(r[0]),) for r in Xd], [float(v) for v in dy],
+            [(1.0,)], 1.0, 1.0, 0.1, 0.1,
+        )
+        self.assertAlmostEqual(res.function_mean[0], ref[0][0], delta=1e-12)
+        self.assertAlmostEqual(res.derivative_mean[0], ref[0][2], delta=1e-12)
+
+
+class TestJointDeterminismImmutability(unittest.TestCase):
+    def test_repeated_calls_identical_and_inputs_unchanged(self):
+        Xf, yf, Xd, dy, T = make_deriv_data()
+        Xf_c = [tuple(v) for v in Xf]
+        Xd_c = [tuple(v) for v in Xd]
+        yf_c, dy_c, T_c = tuple(yf), tuple(dy), [tuple(v) for v in T]
+        r1 = predict_with_derivatives(
+            Xf, yf, Xd, dy, T, DHP, derivative_noise=DSD
+        )
+        r2 = predict_with_derivatives(
+            Xf, yf, Xd, dy, T, DHP, derivative_noise=DSD
+        )
+        self.assertEqual(r1.function_mean, r2.function_mean)
+        self.assertEqual(r1.derivative_mean, r2.derivative_mean)
+        self.assertEqual(r1.function_latent_variance, r2.function_latent_variance)
+        self.assertEqual(r1.derivative_latent_variance, r2.derivative_latent_variance)
+        self.assertEqual([tuple(v) for v in Xf], Xf_c)
+        self.assertEqual([tuple(v) for v in Xd], Xd_c)
+        self.assertEqual([tuple(v) for v in T], T_c)
+        self.assertEqual(tuple(yf), yf_c)
+        self.assertEqual(tuple(dy), dy_c)
+
+    def test_legacy_entrypoints_unchanged(self):
+        # 旧纯函数值入口签名与行为回归 (导入与调用方式不变)
+        X = [(-2.0 + 0.4 * i,) for i in range(12)]
+        y = [math.sin(x[0]) + 0.15 * x[0] for x in X]
+        r = log_marginal(X, y, DHP)
+        p = predict(X, y, [(0.37,)], DHP)
+        self.assertEqual(r.status, "ok")
+        self.assertEqual(p.status, "ok")
+        self.assertFalse(hasattr(p, "derivative_mean"))
 
 
 if __name__ == "__main__":

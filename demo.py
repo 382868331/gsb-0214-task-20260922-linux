@@ -9,13 +9,20 @@ demo.py - gprbf 固定输入演示 (确定性数据, 真实计算, 无网络/无
   2. 边界触发 (拒绝): 重复输入 + 极小噪声且不给 jitter => Cholesky 失败,
      返回 status="not_pd" (绝不自动加未记录 jitter);
      随后给显式 jitter 恢复;
-  3. 异常触发: NaN 输入被 ValueError 拒绝。
+  3. 异常触发: NaN 输入被 ValueError 拒绝;
+  4. 一阶导数联合 GP: 函数值 + 解析导数样本联合训练, 同时预测 f 与 f',
+     打印联合后验与导数后验 95% 置信区间, 并给边界/非法输入各一例。
 """
 
 import math
 import time
 
-from gprbf import Hyperparameters, log_marginal, predict
+from gprbf import (
+    Hyperparameters,
+    log_marginal,
+    predict,
+    predict_with_derivatives,
+)
 
 Z95 = 1.959963984540054  # 标准正态 0.975 分位, 95% 区间
 
@@ -91,6 +98,81 @@ def main():
         print(f"  ValueError 已捕获: {exc}")
     else:
         raise AssertionError("NaN 输入应当被拒绝")
+    print()
+
+    # --- 5. 正常结果: 函数值 + 一阶导数联合 GP ---
+    # 真值 f(x)=sin(x)+0.15x, f'(x)=cos(x)+0.15, 样本由解析公式确定性生成
+    Xf = [(-2.0 + 0.5 * i,) for i in range(9)]
+    yf = [math.sin(v[0]) + 0.15 * v[0] for v in Xf]
+    Xd = [(-1.5,), (-0.5,), (0.5,), (1.5,)]
+    dy = [math.cos(v[0]) + 0.15 for v in Xd]
+    d_noise = 0.12
+    T = [(-1.8,), (-0.9,), (0.0,), (0.9,), (1.8,)]
+    print("[正常结果] 函数值 + 一阶导数联合 GP (函数噪声 0.2, 导数噪声 0.12)")
+    print(f"  函数观测 {len(Xf)} 个, 导数观测 {len(Xd)} 个")
+    dp = predict_with_derivatives(
+        Xf, yf, Xd, dy, T, hp, derivative_noise=d_noise
+    )
+    assert dp.status == "ok", dp.status
+    print(f"  联合协方差对称性残差 = {dp.symmetry_residual:.1e}, "
+          f"求解残差 = {dp.solve_residual:.1e}")
+    print(f"  {'x':>6} | {'f mean':>9} {'f true':>9} | "
+          f"{'f\' mean':>9} {'f\' true':>9} | {'f\' obs sd':>10}")
+    for t, xt in enumerate(T):
+        f_true = math.sin(xt[0]) + 0.15 * xt[0]
+        d_true = math.cos(xt[0]) + 0.15
+        sd_d = math.sqrt(dp.derivative_observed_variance[t])
+        print(f"  {xt[0]:6.2f} | {dp.function_mean[t]:9.6f} {f_true:9.6f} | "
+              f"{dp.derivative_mean[t]:9.6f} {d_true:9.6f} | {sd_d:10.6f}")
+    # 导数后验 95% 区间确实覆盖解析真值
+    cover = all(
+        abs(dp.derivative_mean[t] - (math.cos(T[t][0]) + 0.15))
+        <= Z95 * math.sqrt(dp.derivative_observed_variance[t])
+        for t in range(len(T))
+    )
+    print(f"  5 个点的解析导数真值全部落在联合后验 95% 区间内: {cover}")
+    print()
+
+    # --- 6. 联合 GP 边界: 重复导数点 + 极小导数噪声, 无 jitter => not_pd ---
+    print("[边界触发] 重复导数观测 + 极小导数噪声 (derivative_noise=1e-10)")
+    Xf_b = [(-1.0,), (1.0,)]
+    yf_b = [0.0, 0.0]
+    Xd_b = [(0.0,), (0.0,), (0.5,), (0.5,)]
+    dy_b = [0.3, 0.3, -0.3, -0.3]
+    hp_b = Hyperparameters(1.0, 1.0, 1e-4)
+    bad_d = predict_with_derivatives(
+        Xf_b, yf_b, Xd_b, dy_b, [(0.2,)], hp_b, derivative_noise=1e-10
+    )
+    print(f"  predict_with_derivatives status = {bad_d.status!r} "
+          f"(function_mean={bad_d.function_mean})")
+    print("  -> 联合协方差非正定, 模块拒绝给出结果, 未自动添加任何 jitter。")
+    fixed_d = predict_with_derivatives(
+        Xf_b, yf_b, Xd_b, dy_b, [(0.2,)], hp_b,
+        derivative_noise=1e-10, jitter=1e-6,
+    )
+    print(f"  显式 jitter=1e-6 后 status = {fixed_d.status!r}, "
+          f"f' mean = {fixed_d.derivative_mean[0]:.6f} (jitter 计入两个对角块)")
+    print()
+
+    # --- 7. 联合 GP 非法输入: 二维输入与非正导数噪声均必须明确报错 ---
+    print("[异常触发] 联合导数 GP 的非法输入")
+    try:
+        predict_with_derivatives(
+            [(0.0, 0.0), (1.0, 0.0)], [0.0, 1.0],
+            [(0.5,)], [0.1], [(0.0,)], hp, derivative_noise=0.1,
+        )
+    except ValueError as exc:
+        print(f"  ValueError 已捕获 (二维输入): {exc}")
+    else:
+        raise AssertionError("导数联合 GP 仅支持一维")
+    try:
+        predict_with_derivatives(
+            Xf, yf, Xd, dy, [(0.0,)], hp, derivative_noise=0.0
+        )
+    except ValueError as exc:
+        print(f"  ValueError 已捕获 (导数噪声): {exc}")
+    else:
+        raise AssertionError("derivative_noise 必须为正数")
     print()
 
     print(f"演示完成, 实际耗时 {time.perf_counter() - t0:.2f} 秒。")
