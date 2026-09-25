@@ -9,13 +9,15 @@ demo.py - gprbf 固定输入演示 (确定性数据, 真实计算, 无网络/无
   2. 边界触发 (拒绝): 重复输入 + 极小噪声且不给 jitter => Cholesky 失败,
      返回 status="not_pd" (绝不自动加未记录 jitter);
      随后给显式 jitter 恢复;
-  3. 异常触发: NaN 输入被 ValueError 拒绝。
+  3. 异常触发: NaN 输入被 ValueError 拒绝;
+  4. GPFit 不可变删除: 按稳定 ID 连续删除样本 (Cholesky 行删除更新),
+     与全量重建对照, 删到最后一点后给出先验预测。
 """
 
 import math
 import time
 
-from gprbf import Hyperparameters, log_marginal, predict
+from gprbf import GPFit, Hyperparameters, log_marginal, predict
 
 Z95 = 1.959963984540054  # 标准正态 0.975 分位, 95% 区间
 
@@ -91,6 +93,38 @@ def main():
         print(f"  ValueError 已捕获: {exc}")
     else:
         raise AssertionError("NaN 输入应当被拒绝")
+    print()
+
+    # --- 5. GPFit 不可变删除: 稳定 ID + Cholesky 行删除更新 ---
+    print("[GPFit 删除] 不可变拟合对象, 按稳定样本 ID 删除")
+    fit = GPFit.fit(X, y, hp, sample_ids=[f"s{i}" for i in range(len(X))])
+    print(f"  初始拟合: n={fit.n_samples}, ids={fit.sample_ids}")
+    print(f"  初始 log p(y|X) = {fit.log_marginal().log_marginal:.10f}")
+    cur = fit
+    for sid in ("s0", "s5", "s11"):  # 首 / 中 / 尾
+        nxt = cur.delete(sid)
+        rec = nxt.diagnostics[-1]
+        # 对照: 同一剩余数据上的全量重建
+        ref = log_marginal(list(nxt.X), list(nxt.y), hp)
+        diff = abs(nxt.log_marginal().log_marginal - ref.log_marginal)
+        print(f"  删除 {sid}: n={nxt.n_samples}, 方法={rec.method}, "
+              f"行删除残差={rec.downdate_residual:.1e}, "
+              f"与全量重建 |ΔLML|={diff:.1e}")
+        cur = nxt
+    print(f"  旧对象未变: n={fit.n_samples}, "
+          f"log p(y|X)={fit.log_marginal().log_marginal:.10f}")
+    p_old = fit.predict([(0.0,)])
+    p_new = cur.predict([(0.0,)])
+    print(f"  x=0 处预测: 旧对象 mean={p_old.mean[0]: .6f} "
+          f"(n={fit.n_samples}), 新对象 mean={p_new.mean[0]: .6f} "
+          f"(n={cur.n_samples})")
+    # 连续删除至空 -> 先验预测
+    for sid in list(cur.sample_ids):
+        cur = cur.delete(sid)
+    pe = cur.predict([(0.0,)])
+    print(f"  全部删除后 n={cur.n_samples}: 先验预测 mean={pe.mean[0]}, "
+          f"latent_var={pe.latent_variance[0]:.4f} (=alpha^2), "
+          f"LML={cur.log_marginal().log_marginal}")
     print()
 
     print(f"演示完成, 实际耗时 {time.perf_counter() - t0:.2f} 秒。")

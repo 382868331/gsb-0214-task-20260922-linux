@@ -11,22 +11,28 @@ gprbf - 精确 RBF 高斯过程回归（标准库实现，无第三方依赖）�
   * Cholesky 失败时返回 status="not_pd", 绝不自动加未记录的 jitter。
   * 数值输入拒绝 NaN/Infinity; bool 不作为数值接受。
   * 本模块无状态、不修改调用方传入的数据。
+  * GPFit 为不可变拟合对象: delete(sample_id) 按稳定样本 ID 删除一条,
+    用 Cholesky 行删除 (Givens 旋转) 做 O(n^2) 局部更新并返回新对象,
+    旧对象保持可查询; 数值残差超限时回退全量分解并记入 diagnostics。
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple, Hashable
 
 __all__ = [
     "MAX_SAMPLES",
     "MAX_DIM",
     "MAX_TEST_POINTS",
     "NEG_VAR_REL_TOL",
+    "DOWNDATE_RESIDUAL_RTOL",
     "Hyperparameters",
     "MarginalResult",
     "Prediction",
+    "DeletionRecord",
+    "GPFit",
     "log_marginal",
     "predict",
     "rbf_kernel",
@@ -41,6 +47,9 @@ MAX_DIM = 3
 MAX_TEST_POINTS = 10_000
 #: 预测方差负微量判定容差: raw >= -NEG_VAR_REL_TOL * max(1, alpha^2) 视为数值抹零。
 NEG_VAR_REL_TOL = 1e-10
+#: GPFit 删除样本时 Cholesky 行删除更新的验收容差 (相对 max(1, max diag Ky))。
+#: 超过则回退全量 Cholesky 并在 DeletionRecord 中记录 method="full_refit"。
+DOWNDATE_RESIDUAL_RTOL = 1e-8
 
 _LOG_2PI = math.log(2.0 * math.pi)
 
@@ -395,6 +404,70 @@ def _prepare_training(X, y, hp, jitter):
     return Xv, yv, hpv, jv, hpv.noise * hpv.noise + jv
 
 
+def _lml_not_pd(sym, var, jv) -> MarginalResult:
+    return MarginalResult(
+        status="not_pd",
+        log_marginal=None,
+        gradient=None,
+        alpha_vec=None,
+        K_inv=None,
+        symmetry_residual=sym,
+        chol_residual=None,
+        solve_residual=None,
+        effective_noise_variance=var,
+        jitter=jv,
+    )
+
+
+def _lml_from_factor(Xv, yv, hpv, jv, var, Ky, L, sym) -> MarginalResult:
+    """由已完成的 Cholesky 分解 L (Ky = L L^T) 计算 LML 与解析梯度。"""
+    n = len(Xv)
+    K, D2 = _kernel_and_d2(Xv, hpv)
+    avec = _cho_solve(L, yv)
+
+    chol_res = _chol_residual(Ky, L)
+    solve_res = _max_abs([q - yv[i] for i, q in enumerate(_matvec(Ky, avec))])
+
+    logdet = 0.0
+    for i in range(n):
+        logdet += 2.0 * math.log(L[i][i])
+    quad = sum(yv[i] * avec[i] for i in range(n))
+    lml = -0.5 * (quad + logdet + n * _LOG_2PI)
+
+    Inv = _inverse_via_cholesky(L)
+    tr_inv = sum(Inv[i][i] for i in range(n))
+
+    K_alpha = _matvec(K, avec)
+    quad_K = sum(avec[i] * K_alpha[i] for i in range(n))
+    g_log_a = quad_K - (n - var * tr_inv)
+
+    ell2 = hpv.lengthscale * hpv.lengthscale
+    Kl = [[K[i][j] * D2[i][j] / ell2 for j in range(n)] for i in range(n)]
+    Kl_alpha = _matvec(Kl, avec)
+    quad_Kl = sum(avec[i] * Kl_alpha[i] for i in range(n))
+    tr_inv_Kl = 0.0
+    for i in range(n):
+        for j in range(n):
+            tr_inv_Kl += Inv[i][j] * Kl[j][i]
+    g_log_l = 0.5 * (quad_Kl - tr_inv_Kl)
+
+    s2 = hpv.noise * hpv.noise
+    g_log_s = s2 * (sum(q * q for q in avec) - tr_inv)
+
+    return MarginalResult(
+        status="ok",
+        log_marginal=lml,
+        gradient=(g_log_a, g_log_l, g_log_s),
+        alpha_vec=tuple(avec),
+        K_inv=tuple(tuple(row) for row in Inv),
+        symmetry_residual=sym,
+        chol_residual=chol_res,
+        solve_residual=solve_res,
+        effective_noise_variance=var,
+        jitter=jv,
+    )
+
+
 def log_marginal(
     X: Sequence[Sequence[float]],
     y: Sequence[float],
@@ -413,7 +486,7 @@ def log_marginal(
     """
     Xv, yv, hpv, jv, var = _prepare_training(X, y, hp, jitter)
     n = len(Xv)
-    K, D2 = _kernel_and_d2(Xv, hpv)
+    K, _D2 = _kernel_and_d2(Xv, hpv)
     Ky = [row[:] for row in K]
     for i in range(n):
         Ky[i][i] += var
@@ -421,116 +494,29 @@ def log_marginal(
     sym = _symmetry_residual(Ky)
     L = _cholesky(Ky)
     if L is None:
-        return MarginalResult(
-            status="not_pd",
-            log_marginal=None,
-            gradient=None,
-            alpha_vec=None,
-            K_inv=None,
-            symmetry_residual=sym,
-            chol_residual=None,
-            solve_residual=None,
-            effective_noise_variance=var,
-            jitter=jv,
-        )
+        return _lml_not_pd(sym, var, jv)
+    return _lml_from_factor(Xv, yv, hpv, jv, var, Ky, L, sym)
 
-    avec = _cho_solve(L, yv)
 
-    # 数值残差诊断
-    chol_res = _chol_residual(Ky, L)
-    solve_res = _max_abs([q - yv[i] for i, q in enumerate(_matvec(Ky, avec))])
-
-    logdet = 0.0
-    for i in range(n):
-        logdet += 2.0 * math.log(L[i][i])
-    quad = sum(yv[i] * avec[i] for i in range(n))
-    lml = -0.5 * (quad + logdet + n * _LOG_2PI)
-
-    Inv = _inverse_via_cholesky(L)
-    tr_inv = sum(Inv[i][i] for i in range(n))
-
-    # g_log_alpha: K_y = K + var*I  => tr(K^-1 K) = n - var*tr(K^-1)
-    K_alpha = _matvec(K, avec)
-    quad_K = sum(avec[i] * K_alpha[i] for i in range(n))
-    g_log_a = quad_K - (n - var * tr_inv)
-
-    # g_log_ell: dK/d log ell = K ⊙ D2/ell^2 (无 2 倍因子, 故保留 1/2)
-    ell2 = hpv.lengthscale * hpv.lengthscale
-    Kl = [[K[i][j] * D2[i][j] / ell2 for j in range(n)] for i in range(n)]
-    Kl_alpha = _matvec(Kl, avec)
-    quad_Kl = sum(avec[i] * Kl_alpha[i] for i in range(n))
-    tr_inv_Kl = 0.0
-    for i in range(n):
-        for j in range(n):
-            tr_inv_Kl += Inv[i][j] * Kl[j][i]
-    g_log_l = 0.5 * (quad_Kl - tr_inv_Kl)
-
-    # g_log_noise: dK_y/d log s = 2 s^2 I
-    s2 = hpv.noise * hpv.noise
-    g_log_s = s2 * (sum(q * q for q in avec) - tr_inv)
-
-    return MarginalResult(
-        status="ok",
-        log_marginal=lml,
-        gradient=(g_log_a, g_log_l, g_log_s),
-        alpha_vec=tuple(avec),
-        K_inv=tuple(tuple(row) for row in Inv),
+def _predict_not_pd(sym, var, jv) -> Prediction:
+    return Prediction(
+        status="not_pd",
+        mean=None,
+        latent_variance=None,
+        observed_variance=None,
+        raw_latent_variance=None,
+        clamped=(),
         symmetry_residual=sym,
-        chol_residual=chol_res,
-        solve_residual=solve_res,
+        solve_residual=None,
         effective_noise_variance=var,
         jitter=jv,
     )
 
 
-def predict(
-    X: Sequence[Sequence[float]],
-    y: Sequence[float],
-    X_test: Sequence[Sequence[float]],
-    hp: Hyperparameters,
-    *,
-    jitter: float = 0.0,
-) -> Prediction:
-    """
-    RBF GP 后验预测。
-
-    对每个测试点 x_* (k_* = k(X, x_*)):
-        mean_t            = k_*^T K_y^-1 y
-        raw latent var    = alpha^2 - k_*^T K_y^-1 k_*
-        observed var      = latent_var + noise^2 + jitter
-
-    负微量处理: raw 为负且幅度 <= NEG_VAR_REL_TOL*max(1, alpha^2) 时,
-    latent 抹为 0 并在 clamped 中记录下标; 更负则 status="negative_variance"
-    且原样返回负值, 不静默纠正。
-    """
-    Xv, yv, hpv, jv, var = _prepare_training(X, y, hp, jitter)
-    Xt, _m, _d = _validate_matrix(
-        X_test, "X_test", max_rows=MAX_TEST_POINTS, expect_dim=len(Xv[0])
-    )
+def _predict_from_factor(Xv, yv, hpv, jv, var, Ky, L, sym, Xt) -> Prediction:
+    """由已完成的 Cholesky 分解 L (Ky = L L^T) 计算后验预测。"""
     n = len(Xv)
     m = len(Xt)
-
-    K, _ = _kernel_and_d2(Xv, hpv)
-    Ky = [row[:] for row in K]
-    for i in range(n):
-        Ky[i][i] += var
-    sym = _symmetry_residual(Ky)
-
-    L = _cholesky(Ky)
-    if L is None:
-        return Prediction(
-            status="not_pd",
-            mean=None,
-            latent_variance=None,
-            observed_variance=None,
-            raw_latent_variance=None,
-            clamped=(),
-            symmetry_residual=sym,
-            solve_residual=None,
-            effective_noise_variance=var,
-            jitter=jv,
-        )
-
     avec = _cho_solve(L, yv)
     Ks = _cross_kernel(Xv, Xt, hpv)
     a2 = hpv.alpha * hpv.alpha
@@ -576,3 +562,356 @@ def predict(
         effective_noise_variance=var,
         jitter=jv,
     )
+
+
+def predict(
+    X: Sequence[Sequence[float]],
+    y: Sequence[float],
+    X_test: Sequence[Sequence[float]],
+    hp: Hyperparameters,
+    *,
+    jitter: float = 0.0,
+) -> Prediction:
+    """
+    RBF GP 后验预测。
+
+    对每个测试点 x_* (k_* = k(X, x_*)):
+        mean_t            = k_*^T K_y^-1 y
+        raw latent var    = alpha^2 - k_*^T K_y^-1 k_*
+        observed var      = latent_var + noise^2 + jitter
+
+    负微量处理: raw 为负且幅度 <= NEG_VAR_REL_TOL*max(1, alpha^2) 时,
+    latent 抹为 0 并在 clamped 中记录下标; 更负则 status="negative_variance"
+    且原样返回负值, 不静默纠正。
+    """
+    Xv, yv, hpv, jv, var = _prepare_training(X, y, hp, jitter)
+    Xt, _m, _d = _validate_matrix(
+        X_test, "X_test", max_rows=MAX_TEST_POINTS, expect_dim=len(Xv[0])
+    )
+    n = len(Xv)
+
+    K, _ = _kernel_and_d2(Xv, hpv)
+    Ky = [row[:] for row in K]
+    for i in range(n):
+        Ky[i][i] += var
+    sym = _symmetry_residual(Ky)
+
+    L = _cholesky(Ky)
+    if L is None:
+        return _predict_not_pd(sym, var, jv)
+    return _predict_from_factor(Xv, yv, hpv, jv, var, Ky, L, sym, Xt)
+
+
+# ---------------------------------------------------------------------------
+# GPFit: 不可变拟合对象与按稳定 ID 的样本删除 (Cholesky 行删除更新)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DeletionRecord:
+    """
+    一次 GPFit.delete 的诊断记录。
+
+    removed_id:         被删除样本的稳定 ID。
+    method:
+        "cholesky_downdate" - Cholesky 行删除 (Givens 旋转) O(n^2) 局部更新,
+                              残差验收通过;
+        "full_refit"        - 行删除结果未通过残差验收 (或对角非正),
+                              回退到对压缩后的 Ky 做全量 Cholesky;
+        "trivial_empty"     - 删除后无剩余样本, 无需分解。
+    downdate_residual:  行删除路径的 max|Ky' - L'L'^T| (未走该路径为 None)。
+    chol_residual:      最终采用分解的 max|Ky' - L L^T| (空拟合为 0.0)。
+    """
+
+    removed_id: Hashable
+    method: str
+    downdate_residual: Optional[float]
+    chol_residual: float
+
+
+def _cholesky_delete_row(L, i):
+    """
+    Cholesky 行删除更新: 已知 Ky = L L^T (n x n), 删除 Ky 的第 i 行/列后
+    的新因子 L' ((n-1) x (n-1), Ky' = L' L'^T), 不重新分解。
+
+    原理: 删去 L 的第 i 行得 M ((n-1) x n), 仍有 Ky' = M M^T; 对列对
+    (c, c+1), c = i..n-2 依次施加 Givens 旋转 (右乘正交阵不改变 M M^T),
+    消去尾随块上次对角线, 得到下三角因子并丢弃恒为零的最后一列。
+    总复杂度 O(n^2)。
+    """
+    n = len(L)
+    M = [list(L[r]) for r in range(n) if r != i]
+    for c in range(i, n - 1):
+        a = M[c][c]
+        b = M[c][c + 1]
+        if b == 0.0:
+            continue
+        r = math.hypot(a, b)
+        if r == 0.0:
+            return None
+        cos = a / r
+        sin = b / r
+        for row in range(c, n - 1):
+            u = M[row][c]
+            v = M[row][c + 1]
+            M[row][c] = cos * u + sin * v
+            M[row][c + 1] = cos * v - sin * u
+    Lnew = [row[: n - 1] for row in M]
+    for d in range(n - 1):
+        if not (Lnew[d][d] > 0.0) or math.isnan(Lnew[d][d]):
+            return None
+    return Lnew
+
+
+def _delete_row_col(A, i):
+    return [
+        [A[r][c] for c in range(len(A)) if c != i]
+        for r in range(len(A))
+        if r != i
+    ]
+
+
+class GPFit:
+    """
+    不可变 GP 拟合对象: 持有训练数据 (带稳定样本 ID)、超参数、显式 jitter
+    以及训练协方差 Ky 的 Cholesky 因子。
+
+    构造: GPFit.fit(X, y, hp, *, jitter=0.0, sample_ids=None)
+      sample_ids 缺省为 (0, 1, ..., n-1); 给定时必须可哈希且互不重复。
+      ID 与样本终身绑定: delete 只删除不复用, 剩余 ID 始终指向原样本。
+
+    删除: fit2 = fit.delete(sample_id)
+      返回新 GPFit (训练点顺序被压缩, 但 ID 不变), 原 fit 完全不变、
+      可继续查询。内部用 Cholesky 行删除 (Givens 旋转) 做 O(n^2) 局部更新,
+      不把每次删除当作全量 fit; 残差验收失败时回退全量分解,
+      两者都记入新对象的 diagnostics (旧对象诊断保持不变)。
+      未知 ID 抛 KeyError。
+
+    查询: log_marginal() / predict(X_test) 与模块级同名函数契约一致,
+      全部使用当前剩余样本数 n。删除最后一点后 (n=0):
+      log_marginal() 返回空数据似然 0.0、零梯度;
+      predict() 返回先验预测 (均值 0, 隐方差 alpha^2,
+      观测方差 alpha^2 + noise^2 + jitter), 不产生空矩阵索引错误。
+
+    对象不可变: 所有内部状态在构造时定型, 无任何修改方法。
+    """
+
+    __slots__ = (
+        "_X", "_y", "_ids", "_hp", "_jitter", "_var",
+        "_Ky", "_L", "_status", "_sym", "_diagnostics", "_dim",
+    )
+
+    def __init__(self):
+        raise TypeError("GPFit: use GPFit.fit(...) or fit.delete(...)")
+
+    @classmethod
+    def _from_state(cls, X, y, ids, hp, jitter, var, Ky, L, status, sym, diags, dim):
+        obj = object.__new__(cls)
+        obj._X = X
+        obj._y = y
+        obj._ids = ids
+        obj._hp = hp
+        obj._jitter = jitter
+        obj._var = var
+        obj._Ky = Ky
+        obj._L = L
+        obj._status = status
+        obj._sym = sym
+        obj._diagnostics = diags
+        obj._dim = dim
+        return obj
+
+    @classmethod
+    def fit(
+        cls,
+        X: Sequence[Sequence[float]],
+        y: Sequence[float],
+        hp: Hyperparameters,
+        *,
+        jitter: float = 0.0,
+        sample_ids: Optional[Sequence[Hashable]] = None,
+    ) -> "GPFit":
+        """全量初始拟合 (唯一做完整 Cholesky 的入口)。"""
+        Xv, yv, hpv, jv, var = _prepare_training(X, y, hp, jitter)
+        n = len(Xv)
+        ids = cls._validate_ids(sample_ids, n)
+
+        K, _ = _kernel_and_d2(Xv, hpv)
+        Ky = [row[:] for row in K]
+        for i in range(n):
+            Ky[i][i] += var
+        sym = _symmetry_residual(Ky)
+        L = _cholesky(Ky)
+        status = "ok" if L is not None else "not_pd"
+        return cls._from_state(
+            Xv, yv, ids, hpv, jv, var, Ky, L, status, sym, (), len(Xv[0])
+        )
+
+    @staticmethod
+    def _validate_ids(sample_ids, n) -> Tuple[Hashable, ...]:
+        if sample_ids is None:
+            return tuple(range(n))
+        if not isinstance(sample_ids, (list, tuple)):
+            raise TypeError(
+                f"sample_ids: expected list/tuple, got {type(sample_ids).__name__}"
+            )
+        if len(sample_ids) != n:
+            raise ValueError(
+                f"sample_ids: length {len(sample_ids)} != number of samples {n}"
+            )
+        ids = tuple(sample_ids)
+        seen = set()
+        for k, sid in enumerate(ids):
+            try:
+                if sid in seen:
+                    raise ValueError(f"sample_ids[{k}]: duplicate id {sid!r}")
+                seen.add(sid)
+            except TypeError:
+                raise TypeError(f"sample_ids[{k}]: unhashable id {sid!r}") from None
+        return ids
+
+    # -- 只读属性 -----------------------------------------------------------
+
+    @property
+    def sample_ids(self) -> Tuple[Hashable, ...]:
+        return self._ids
+
+    @property
+    def n_samples(self) -> int:
+        return len(self._ids)
+
+    @property
+    def hyperparameters(self) -> Hyperparameters:
+        return self._hp
+
+    @property
+    def jitter(self) -> float:
+        return self._jitter
+
+    @property
+    def status(self) -> str:
+        """初始/当前分解状态: "ok" 或 "not_pd"。"""
+        return self._status
+
+    @property
+    def diagnostics(self) -> Tuple[DeletionRecord, ...]:
+        return self._diagnostics
+
+    @property
+    def X(self) -> Tuple[Tuple[float, ...], ...]:
+        return self._X
+
+    @property
+    def y(self) -> Tuple[float, ...]:
+        return self._y
+
+    # -- 删除 ---------------------------------------------------------------
+
+    def delete(self, sample_id: Hashable) -> "GPFit":
+        """按稳定 ID 删除一条样本, 返回新 GPFit; 本对象不变。"""
+        try:
+            i = self._ids.index(sample_id)
+        except ValueError:
+            raise KeyError(
+                f"delete: unknown sample id {sample_id!r}; "
+                f"known ids: {self._ids!r}"
+            ) from None
+
+        X2 = tuple(row for k, row in enumerate(self._X) if k != i)
+        y2 = tuple(v for k, v in enumerate(self._y) if k != i)
+        ids2 = tuple(sid for k, sid in enumerate(self._ids) if k != i)
+        n2 = len(ids2)
+
+        if n2 == 0:
+            rec = DeletionRecord(sample_id, "trivial_empty", None, 0.0)
+            return GPFit._from_state(
+                X2, y2, ids2, self._hp, self._jitter, self._var,
+                (), (), "ok", 0.0, self._diagnostics + (rec,), self._dim,
+            )
+
+        Ky2 = _delete_row_col(self._Ky, i)
+        sym2 = _symmetry_residual(Ky2)
+        tol = DOWNDATE_RESIDUAL_RTOL * max(
+            1.0, max(abs(Ky2[d][d]) for d in range(n2))
+        )
+
+        L2 = None
+        dd_res = None
+        method = "cholesky_downdate"
+        if self._L is not None:
+            cand = _cholesky_delete_row(self._L, i)
+            if cand is not None:
+                dd_res = _chol_residual(Ky2, cand)
+                if dd_res <= tol:
+                    L2 = cand
+        if L2 is None:
+            # 数值验收失败: 明确回退全量分解, 并在诊断中记录
+            method = "full_refit"
+            L2 = _cholesky(Ky2)
+
+        if L2 is None:
+            status2 = "not_pd"
+            chol_res = None
+        else:
+            status2 = "ok"
+            chol_res = _chol_residual(Ky2, L2)
+        rec = DeletionRecord(sample_id, method, dd_res, chol_res)
+        return GPFit._from_state(
+            X2, y2, ids2, self._hp, self._jitter, self._var,
+            Ky2, L2, status2, sym2, self._diagnostics + (rec,), self._dim,
+        )
+
+    # -- 查询 (全部使用当前剩余样本数) --------------------------------------
+
+    def log_marginal(self) -> MarginalResult:
+        """当前剩余训练集上的 log 边际似然与解析梯度 (契约同模块级函数)。"""
+        n = len(self._ids)
+        if n == 0:
+            # 空数据集: LML 为空和 0.0, 梯度为零向量
+            return MarginalResult(
+                status="ok",
+                log_marginal=0.0,
+                gradient=(0.0, 0.0, 0.0),
+                alpha_vec=(),
+                K_inv=(),
+                symmetry_residual=0.0,
+                chol_residual=0.0,
+                solve_residual=0.0,
+                effective_noise_variance=self._var,
+                jitter=self._jitter,
+            )
+        if self._status != "ok":
+            return _lml_not_pd(self._sym, self._var, self._jitter)
+        return _lml_from_factor(
+            self._X, self._y, self._hp, self._jitter, self._var,
+            self._Ky, self._L, self._sym,
+        )
+
+    def predict(self, X_test: Sequence[Sequence[float]]) -> Prediction:
+        """当前剩余训练集上的后验预测 (契约同模块级函数)。"""
+        n = len(self._ids)
+        Xt, _m, _d = _validate_matrix(
+            X_test, "X_test", max_rows=MAX_TEST_POINTS, expect_dim=self._dim
+        )
+        if n == 0:
+            # 先验预测: 均值 0, 隐方差 alpha^2, 观测方差 alpha^2 + s^2 + jitter
+            m = len(Xt)
+            a2 = self._hp.alpha * self._hp.alpha
+            return Prediction(
+                status="ok",
+                mean=(0.0,) * m,
+                latent_variance=(a2,) * m,
+                observed_variance=(a2 + self._var,) * m,
+                raw_latent_variance=(a2,) * m,
+                clamped=(),
+                symmetry_residual=0.0,
+                solve_residual=0.0,
+                effective_noise_variance=self._var,
+                jitter=self._jitter,
+            )
+        if self._status != "ok":
+            return _predict_not_pd(self._sym, self._var, self._jitter)
+        return _predict_from_factor(
+            self._X, self._y, self._hp, self._jitter, self._var,
+            self._Ky, self._L, self._sym, Xt,
+        )
