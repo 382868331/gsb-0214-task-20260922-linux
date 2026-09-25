@@ -15,7 +15,7 @@ demo.py - gprbf 固定输入演示 (确定性数据, 真实计算, 无网络/无
 import math
 import time
 
-from gprbf import Hyperparameters, log_marginal, predict
+from gprbf import Hyperparameters, fit_gp, log_marginal, predict
 
 Z95 = 1.959963984540054  # 标准正态 0.975 分位, 95% 区间
 
@@ -91,6 +91,41 @@ def main():
         print(f"  ValueError 已捕获: {exc}")
     else:
         raise AssertionError("NaN 输入应当被拒绝")
+    print()
+
+    # --- 5. 不可变 fit 对象: 按稳定 ID 删除样本 (Cholesky 删除更新) ---
+    print("[删除演示] fit_gp 构造不可变对象, delete(id) 生成新对象")
+    ids = tuple(f"s{i}" for i in range(len(X)))
+    fit = fit_gp(X, y, hp, jitter=1e-6, ids=ids)
+    print(f"  原始对象: n={fit.n}, ids={fit.ids[:4]}..., factor_source={fit.factor_source}")
+    fit_d = fit.delete("s4")  # 删除中部一条
+    md = fit_d.marginal()
+    # 独立全量重建对照
+    keep = [i for i in range(len(X)) if i != 4]
+    ref = log_marginal([X[i] for i in keep], [y[i] for i in keep], hp, jitter=1e-6)
+    print(f"  删除 's4' 后: n={fit_d.n}, factor_source={fit_d.factor_source}, "
+          f"downdate_residual={fit_d.downdate_residual:.1e}")
+    print(f"  新 log p(y|X) = {md.log_marginal:.10f}  "
+          f"(全量重建对照 {ref.log_marginal:.10f}, 差 {abs(md.log_marginal - ref.log_marginal):.1e})")
+    pd_ = fit_d.predict(X_test)
+    print(f"  删除后预测 x=0.0: mean={pd_.mean[2]:.6f}, "
+          f"latent var={pd_.latent_variance[2]:.6f}, observed var={pd_.observed_variance[2]:.6f}")
+    # 旧对象不受影响, 仍可查询
+    print(f"  旧对象仍可查询: n={fit.n}, log p(y|X) = {fit.marginal().log_marginal:.10f}")
+    # 连续删除直至只剩一条, 再删即先验
+    fit_c = fit
+    for sid in ids[1:]:
+        fit_c = fit_c.delete(sid)
+    print(f"  连续删除至 n={fit_c.n} (ids={fit_c.ids})")
+    fit_empty = fit_c.delete(ids[0])
+    pe = fit_empty.predict([(0.0,)])
+    print(f"  再删最后一条: n={fit_empty.n}, 先验预测 mean={pe.mean[0]}, "
+          f"latent var={pe.latent_variance[0]:.4f} (= alpha^2), "
+          f"observed var={pe.observed_variance[0]:.6f}")
+    try:
+        fit_empty.delete("s0")
+    except KeyError as exc:
+        print(f"  未知 ID 拒绝: KeyError {exc}")
     print()
 
     print(f"演示完成, 实际耗时 {time.perf_counter() - t0:.2f} 秒。")

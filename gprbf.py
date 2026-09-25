@@ -27,11 +27,17 @@ __all__ = [
     "Hyperparameters",
     "MarginalResult",
     "Prediction",
+    "GPFit",
+    "fit_gp",
     "log_marginal",
     "predict",
     "rbf_kernel",
     "classify_raw_variance",
 ]
+
+#: GPFit 删除更新后 Cholesky 因子的验收容差 (相对 max(1, alpha^2+var) 量级),
+#: 超过则明确回退全量分解并在诊断中记录。
+DOWNDATE_REL_TOL = 1e-8
 
 #: 训练样本数硬上限（题面接口边界）。
 MAX_SAMPLES = 80
@@ -576,3 +582,363 @@ def predict(
         effective_noise_variance=var,
         jitter=jv,
     )
+
+
+# ---------------------------------------------------------------------------
+# 不可变拟合对象 GPFit: 支持按稳定样本 ID 删除一条样本 (Cholesky 删除更新)
+# ---------------------------------------------------------------------------
+
+
+def _chol_delete_row(L, k):
+    """
+    Cholesky 删除更新: 已知 K = L L^T (n x n 下三角), 删除 K 的第 k 行/列后
+    对应 (n-1) 阶矩阵的 Cholesky 因子。
+
+    做法: 删去 L 的第 k 行得到 A ((n-1) x n, 满足 A A^T = K_new)。
+    A 的行 i >= k 多出一个上对角元 A[i][i+1]; 对 i = k .. n-2 在相邻
+    列 (i, i+1) 间做 Givens 旋转将其消去 (右乘正交矩阵, 保持 A A^T 不变),
+    最后舍去全零末列。复杂度 O((n-k)*n), 不是全量重新分解。
+    返回 list[list] 下三角因子 (对角恒正)。
+    """
+    n = len(L)
+    A = [list(L[i]) for i in range(n) if i != k]
+    for i in range(k, n - 1):
+        a = A[i][i]
+        b = A[i][i + 1]
+        r = math.hypot(a, b)
+        c = a / r
+        s = b / r
+        for row in range(n - 1):
+            u = A[row][i]
+            v = A[row][i + 1]
+            A[row][i] = c * u + s * v
+            A[row][i + 1] = c * v - s * u
+    return [row[: n - 1] for row in A]
+
+
+def _validate_ids(ids, n):
+    if not isinstance(ids, (list, tuple)):
+        raise TypeError(f"ids: expected list/tuple, got {type(ids).__name__}")
+    if len(ids) != n:
+        raise ValueError(f"ids: length {len(ids)} != number of samples {n}")
+    out = []
+    seen = set()
+    for i, v in enumerate(ids):
+        if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+            raise TypeError(
+                f"ids[{i}]: expected int/float/str sample id (bool rejected), "
+                f"got {type(v).__name__}"
+            )
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            raise ValueError(f"ids[{i}]: must be finite (NaN/Infinity rejected)")
+        if v in seen:
+            raise ValueError(f"ids[{i}]: duplicate sample id {v!r}")
+        seen.add(v)
+        out.append(v)
+    return tuple(out)
+
+
+def _summarize_from_factor(Xv, L, yv, hpv, var):
+    """由已有 Cholesky 因子计算 lml/解析梯度/alpha_vec/K_inv 及残差诊断。"""
+    n = len(yv)
+    K, D2 = _kernel_and_d2(Xv, hpv)
+    Ky = [row[:] for row in K]
+    for i in range(n):
+        Ky[i][i] += var
+    avec = _cho_solve(L, yv)
+    solve_res = _max_abs([q - yv[i] for i, q in enumerate(_matvec(Ky, avec))])
+
+    logdet = 0.0
+    for i in range(n):
+        logdet += 2.0 * math.log(L[i][i])
+    quad = sum(yv[i] * avec[i] for i in range(n))
+    lml = -0.5 * (quad + logdet + n * _LOG_2PI)
+
+    Inv = _inverse_via_cholesky(L)
+    tr_inv = sum(Inv[i][i] for i in range(n))
+
+    K_alpha = _matvec(K, avec)
+    quad_K = sum(avec[i] * K_alpha[i] for i in range(n))
+    g_log_a = quad_K - (n - var * tr_inv)
+
+    ell2 = hpv.lengthscale * hpv.lengthscale
+    Kl = [[K[i][j] * D2[i][j] / ell2 for j in range(n)] for i in range(n)]
+    Kl_alpha = _matvec(Kl, avec)
+    quad_Kl = sum(avec[i] * Kl_alpha[i] for i in range(n))
+    tr_inv_Kl = 0.0
+    for i in range(n):
+        for j in range(n):
+            tr_inv_Kl += Inv[i][j] * Kl[j][i]
+    g_log_l = 0.5 * (quad_Kl - tr_inv_Kl)
+
+    s2 = hpv.noise * hpv.noise
+    g_log_s = s2 * (sum(q * q for q in avec) - tr_inv)
+
+    return lml, (g_log_a, g_log_l, g_log_s), avec, Inv, solve_res
+
+
+class GPFit:
+    """
+    不可变 GP 拟合对象: 固定超参数与显式 jitter, 持有训练数据、稳定样本 ID
+    与 Cholesky 因子。所有查询方法不修改对象; delete() 生成新对象,
+    旧对象保持可查询。
+
+    构造请用 fit_gp(X, y, hp, *, jitter=0.0, ids=None)。
+
+    只读属性:
+        n / ids / X / y / hyperparameters / jitter / effective_noise_variance
+        status            - "ok" 或 "not_pd" (初始拟合即非正定)
+        factor_source     - 本对象 Cholesky 因子来源:
+                            "full"     初始全量分解;
+                            "downdate" 由父对象经 Givens 旋转删除更新得到;
+                            "refactor" 删除更新未通过数值验收 (或父对象 not_pd),
+                                       已明确回退为对剩余样本的全量分解。
+        downdate_residual - 删除更新因子 L_new 的 max|K_new - L_new L_new^T|
+                            验收残差; 未做删除更新为 None。
+    """
+
+    __slots__ = (
+        "_X", "_y", "_hp", "_jitter", "_var", "_ids", "_L", "_status",
+        "_factor_source", "_downdate_residual",
+    )
+
+    def __init__(self, Xv, yv, hpv, jv, ids, L, status, factor_source,
+                 downdate_residual):
+        self._X = Xv
+        self._y = yv
+        self._hp = hpv
+        self._jitter = jv
+        self._var = hpv.noise * hpv.noise + jv
+        self._ids = ids
+        self._L = L
+        self._status = status
+        self._factor_source = factor_source
+        self._downdate_residual = downdate_residual
+
+    # -- 只读属性 ---------------------------------------------------------
+
+    @property
+    def n(self):
+        return len(self._X)
+
+    @property
+    def ids(self):
+        return self._ids
+
+    @property
+    def X(self):
+        return self._X
+
+    @property
+    def y(self):
+        return self._y
+
+    @property
+    def hyperparameters(self):
+        return self._hp
+
+    @property
+    def jitter(self):
+        return self._jitter
+
+    @property
+    def effective_noise_variance(self):
+        return self._var
+
+    @property
+    def status(self):
+        return self._status
+
+    @property
+    def factor_source(self):
+        return self._factor_source
+
+    @property
+    def downdate_residual(self):
+        return self._downdate_residual
+
+    def __repr__(self):
+        return (
+            f"GPFit(n={self.n}, status={self._status!r}, "
+            f"factor_source={self._factor_source!r}, ids={self._ids!r})"
+        )
+
+    # -- 查询 -------------------------------------------------------------
+
+    def marginal(self) -> MarginalResult:
+        """当前样本集上的 log 边际似然与解析梯度 (使用新样本数 n)。"""
+        var = self._var
+        if self._status == "not_pd":
+            return MarginalResult(
+                status="not_pd", log_marginal=None, gradient=None,
+                alpha_vec=None, K_inv=None,
+                symmetry_residual=_symmetry_residual(self._ky()),
+                chol_residual=None, solve_residual=None,
+                effective_noise_variance=var, jitter=self._jitter,
+            )
+        if self.n == 0:
+            # 空样本集: log p(空 y) = 0, 梯度为零向量, 无矩阵可分解
+            return MarginalResult(
+                status="ok", log_marginal=0.0, gradient=(0.0, 0.0, 0.0),
+                alpha_vec=(), K_inv=(),
+                symmetry_residual=0.0, chol_residual=0.0, solve_residual=0.0,
+                effective_noise_variance=var, jitter=self._jitter,
+            )
+        Ky = self._ky()
+        lml, grad, avec, Inv, solve_res = _summarize_from_factor(
+            self._X, self._L, self._y, self._hp, var
+        )
+        return MarginalResult(
+            status="ok", log_marginal=lml, gradient=grad,
+            alpha_vec=tuple(avec), K_inv=tuple(tuple(r) for r in Inv),
+            symmetry_residual=_symmetry_residual(Ky),
+            chol_residual=_chol_residual(Ky, self._L),
+            solve_residual=solve_res,
+            effective_noise_variance=var, jitter=self._jitter,
+        )
+
+    def predict(self, X_test) -> Prediction:
+        """当前样本集上的 latent/observed 后验预测 (使用新样本数 n)。"""
+        hpv = self._hp
+        var = self._var
+        d = len(self._X[0]) if self._X else None
+        Xt, m, _ = _validate_matrix(
+            X_test, "X_test", max_rows=MAX_TEST_POINTS, expect_dim=d
+        )
+        if self._status == "not_pd":
+            return Prediction(
+                status="not_pd", mean=None, latent_variance=None,
+                observed_variance=None, raw_latent_variance=None, clamped=(),
+                symmetry_residual=_symmetry_residual(self._ky()),
+                solve_residual=None,
+                effective_noise_variance=var, jitter=self._jitter,
+            )
+        a2 = hpv.alpha * hpv.alpha
+        if self.n == 0:
+            # 先验预测: 零均值, latent 方差 alpha^2, observed 再加噪声方差
+            return Prediction(
+                status="ok",
+                mean=tuple(0.0 for _ in range(m)),
+                latent_variance=tuple(a2 for _ in range(m)),
+                observed_variance=tuple(a2 + var for _ in range(m)),
+                raw_latent_variance=tuple(a2 for _ in range(m)),
+                clamped=(),
+                symmetry_residual=0.0, solve_residual=0.0,
+                effective_noise_variance=var, jitter=self._jitter,
+            )
+        Ky = self._ky()
+        avec = _cho_solve(self._L, self._y)
+        Ks = _cross_kernel(self._X, Xt, hpv)
+        n = self.n
+
+        means = [0.0] * m
+        raw_var = [0.0] * m
+        latent = [0.0] * m
+        observed = [0.0] * m
+        clamped = []
+        hard_negative = False
+        solve_res = 0.0
+        for t in range(m):
+            kvec = [Ks[i][t] for i in range(n)]
+            w = _cho_solve(self._L, kvec)
+            means[t] = sum(kvec[i] * avec[i] for i in range(n))
+            raw = a2 - sum(kvec[i] * w[i] for i in range(n))
+            raw_var[t] = raw
+            r = _max_abs([q - kvec[i] for i, q in enumerate(_matvec(Ky, w))])
+            if r > solve_res:
+                solve_res = r
+            v, kind = classify_raw_variance(raw, a2)
+            latent[t] = v
+            observed[t] = v + var
+            if kind == "clamped":
+                clamped.append(t)
+            elif kind == "negative":
+                hard_negative = True
+        return Prediction(
+            status="negative_variance" if hard_negative else "ok",
+            mean=tuple(means), latent_variance=tuple(latent),
+            observed_variance=tuple(observed),
+            raw_latent_variance=tuple(raw_var), clamped=tuple(clamped),
+            symmetry_residual=_symmetry_residual(Ky), solve_residual=solve_res,
+            effective_noise_variance=var, jitter=self._jitter,
+        )
+
+    # -- 删除 -------------------------------------------------------------
+
+    def delete(self, sample_id) -> "GPFit":
+        """
+        按稳定样本 ID 删除一条样本, 返回新的 GPFit; 本对象不变、仍可查询。
+
+        核参数与显式 jitter 原样保留; 剩余样本顺序压缩但 ID 不变、不复用。
+        优先做 Cholesky 删除更新 (Givens 旋转, O(n^2)); 更新因子未通过
+        数值验收 (或本对象 not_pd 无因子可用) 时明确回退全量分解,
+        并在新对象的 factor_source / downdate_residual 诊断中记录。
+        未知 ID 抛 KeyError。
+        """
+        if sample_id not in self._ids:
+            raise KeyError(f"delete: unknown sample id {sample_id!r}")
+        k = self._ids.index(sample_id)
+        X_new = self._X[:k] + self._X[k + 1:]
+        y_new = self._y[:k] + self._y[k + 1:]
+        ids_new = self._ids[:k] + self._ids[k + 1:]
+
+        if not X_new:
+            # 删除最后一条: 空拟合对象, 预测退化为先验
+            return GPFit((), (), self._hp, self._jitter, ids_new, None,
+                         "ok", self._factor_source, None)
+
+        if self._status == "ok" and self._L is not None:
+            L_new = _chol_delete_row(self._L, k)
+            Ky_new = _ky_of(X_new, self._hp, self._var)
+            res = _chol_residual(Ky_new, L_new)
+            ok = math.isfinite(res) and res <= DOWNDATE_REL_TOL * max(
+                1.0, self._hp.alpha * self._hp.alpha + self._var
+            )
+            if ok:
+                return GPFit(X_new, y_new, self._hp, self._jitter, ids_new,
+                             L_new, "ok", "downdate", res)
+            # 数值验收失败: 明确回退全量分解, 残差留在诊断中
+            L_full = _cholesky(Ky_new)
+            return GPFit(X_new, y_new, self._hp, self._jitter, ids_new,
+                         L_full, "ok" if L_full is not None else "not_pd",
+                         "refactor", res)
+
+        # 本对象 not_pd (无可用因子): 对剩余样本全量分解, 可能恢复为正定
+        L_full = _cholesky(_ky_of(X_new, self._hp, self._var))
+        return GPFit(X_new, y_new, self._hp, self._jitter, ids_new,
+                     L_full, "ok" if L_full is not None else "not_pd",
+                     "refactor", None)
+
+    # -- 内部 -------------------------------------------------------------
+
+    def _ky(self):
+        return _ky_of(self._X, self._hp, self._var)
+
+
+def _ky_of(Xv, hpv, var):
+    K, _ = _kernel_and_d2(Xv, hpv)
+    for i in range(len(Xv)):
+        K[i][i] += var
+    return K
+
+
+def fit_gp(
+    X: Sequence[Sequence[float]],
+    y: Sequence[float],
+    hp: Hyperparameters,
+    *,
+    jitter: float = 0.0,
+    ids: Optional[Sequence] = None,
+) -> GPFit:
+    """
+    构造不可变 GPFit: 校验输入并做初始全量 Cholesky 分解。
+
+    ids: 稳定样本 ID (int/float/str, 唯一, 非 bool, 数值须有限);
+         缺省为 (0, 1, ..., n-1)。删除只按 ID 进行, ID 永不复用。
+    """
+    Xv, yv, hpv, jv, var = _prepare_training(X, y, hp, jitter)
+    n = len(Xv)
+    ids_v = _validate_ids(ids, n) if ids is not None else tuple(range(n))
+    L = _cholesky(_ky_of(Xv, hpv, var))
+    return GPFit(Xv, yv, hpv, jv, ids_v, L,
+                 "ok" if L is not None else "not_pd", "full", None)

@@ -13,8 +13,8 @@ K_y      = K(X, X) + (noise^2 + jitter) * I,   alpha / lengthscale / noise > 0
 ## 运行命令
 
 ```bash
-python -m unittest discover -s tests -v   # 24 个测试, 实测 < 1 秒
-python demo.py                             # 固定输入演示, 实测约 0.04 秒（上限 8 秒内）
+python -m unittest discover -s tests -v   # 36 个测试, 实测 < 1 秒
+python demo.py                             # 固定输入演示, 实测约 0.04 秒（上限 90 秒内）
 ```
 
 无需安装任何依赖（`requirements.txt` 为空占位）；不需要网络、账号、密钥、数据库或 Docker。
@@ -25,6 +25,7 @@ python demo.py                             # 固定输入演示, 实测约 0.04 
 |---|---|
 | `gprbf.py` | 本题库本体：校验、RBF 核、Cholesky、log 边际似然、解析梯度、后验预测 |
 | `tests/test_gprbf.py` | 必要测试；**独立参考**（Gauss-Jordan 直接逆、独立核函数、独立 logdet、单点显式逆公式、中心差分）不导入被测核心来产生期望值 |
+| `tests/test_gpfit_delete.py` | GPFit 删除测试：重复坐标有噪声、删首/中/尾、连续删除、未知 ID、删空后先验；与全量重建对照 |
 | `demo.py` | 确定性数据演示：正常结果（含 95% 置信区间）+ 实际触发的 `not_pd` 边界与 `ValueError` 拒绝 |
 
 ## 接口
@@ -59,6 +60,35 @@ p = predict(X, y, X_test, hp, *, jitter=0.0)
 
 结果均为冻结 `dataclass`，字段以 `None`/元组区分成功与失败状态；函数无状态、不修改入参、
 重复调用逐位一致。
+
+### 不可变拟合对象 GPFit（按稳定 ID 删除样本）
+
+```python
+from gprbf import fit_gp
+
+fit = fit_gp(X, y, hp, *, jitter=0.0, ids=None)   # ids 缺省为 (0..n-1)
+fit.n / fit.ids / fit.X / fit.y / fit.hyperparameters / fit.jitter
+m = fit.marginal()        # 与 log_marginal 相同的 MarginalResult
+p = fit.predict(X_test)   # 与 predict 相同的 Prediction
+
+fit2 = fit.delete("s4")   # 按稳定样本 ID 删除一条, 返回新对象; fit 本身不变
+```
+
+- **不可变**：`fit_gp` 返回的 `GPFit` 不暴露任何修改操作；`delete()` 生成新对象，
+  旧对象保持原样、可继续查询（测试覆盖）。
+- **稳定 ID**：`ids` 为 `int/float/str`（拒绝 bool、NaN/Inf、重复值），删除后剩余样本
+  顺序压缩但 ID 不变、**已删 ID 不复用**（对新对象而言即未知 ID）；未知 ID 抛 `KeyError`。
+- **核参数与显式 jitter 不变**：`delete` 不重新估计超参，也不改变 jitter。
+- **Cholesky 删除更新**：删除第 k 行/列通过 Givens 旋转对 Cholesky 因子做 O(n²)
+  局部更新（`_chol_delete_row`），不做全量重新分解；更新因子用
+  `max|K_new − L Lᵀ| ≤ 1e-8·max(1, α²+var)` 验收，**失败时明确回退全量分解**，
+  并记录在新对象诊断中：`factor_source ∈ {"full","downdate","refactor"}` 与
+  `downdate_residual`（父对象 `not_pd` 无因子可用时也走 `refactor`）。
+- **删除后所有量使用新样本数 n**：`marginal()` 的似然/解析梯度与
+  `predict()` 的 latent/observed 方差都基于删除后的样本集。
+- **删到最后一条**：返回空拟合对象（n=0），`marginal()` 为 `log p(∅)=0`、零梯度，
+  `predict()` 退化为先验：均值 0、latent 方差 α²、observed 方差 α²+s²+jitter，
+  不产生空矩阵索引错误。
 
 ## 输入上限与错误语义
 
@@ -126,3 +156,5 @@ p = predict(X, y, X_test, hp, *, jitter=0.0)
   `"not_pd"` 状态显式表达（这是“矩阵被证明在此浮点表示下无法分解”，区别于输入非法）。
 - 纯 Python O(n³)，面向 n≤80；更大规模不适用。
 - 预测方差的负微量阈值固定为相对 `max(1, α²)` 的 1e-10。
+- `GPFit` 仅支持删除，不支持插入/更新样本；删除更新验收容差固定为
+  `1e-8·max(1, α²+var)`，超过即回退全量分解并记录。
