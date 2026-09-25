@@ -3,29 +3,53 @@
 仅使用 **Python 3.14.7 标准库**（`math`/`dataclasses`/`typing`/`unittest`）实现的可导入单文件库，
 零第三方依赖，全程离线。不调用任何机器学习库，也不使用第三方同类实现替代核心算法。
 
+**增量能力（本次）**：多个查询点的**联合后验满协方差**与调用方给定标准正态数的
+**相关函数样本**（`joint_posterior` / `sample_posterior`），支持重复查询点（秩亏损但保留完全
+相关性）、训练点零噪声精确插值、空查询，以及固定观测值的路径条件化。逐点 `predict` 均值接口
+与旧行为完全不变。
+
 核函数与训练协方差：
 
 ```
 k(x, x') = alpha^2 * exp(-||x - x'||^2 / (2 * lengthscale^2))
-K_y      = K(X, X) + (noise^2 + jitter) * I,   alpha / lengthscale / noise > 0
+K_y      = K(X, X) + (noise^2 + jitter) * I,   alpha / lengthscale > 0, noise >= 0
+# 常规 log_marginal/predict 仍要求 noise > 0;
+# 零噪声 (训练点精确插值) 仅由 joint_posterior/sample_posterior 在
+# allow_zero_noise=True 时显式启用。
 ```
 
 ## 运行命令
 
 ```bash
-python -m unittest discover -s tests -v   # 24 个测试, 实测 < 1 秒
+python -m unittest discover -s tests -v   # 基线回归 + 联合抽样测试, 实测约 3 秒
 python demo.py                             # 固定输入演示, 实测约 0.04 秒（上限 8 秒内）
+python demo_iteration.py                   # 联合相关抽样真实离线演示, 实测 < 1 秒（上限 90 秒）
 ```
 
 无需安装任何依赖（`requirements.txt` 为空占位）；不需要网络、账号、密钥、数据库或 Docker。
+
+### 隔离 venv 准备（可选，仅用标准库）
+
+```bash
+python3.14 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip   # 不需要安装任何第三方包; requirements.txt 为空
+python -m unittest discover -s tests -v
+python demo_iteration.py
+deactivate
+```
+
+不使用 venv 也可直接运行；全程不读取任何随机种子配置或环境变量，标准正态数由调用方显式传入。
 
 ## 文件
 
 | 文件 | 说明 |
 |---|---|
 | `gprbf.py` | 本题库本体：校验、RBF 核、Cholesky、log 边际似然、解析梯度、后验预测 |
-| `tests/test_gprbf.py` | 必要测试；**独立参考**（Gauss-Jordan 直接逆、独立核函数、独立 logdet、单点显式逆公式、中心差分）不导入被测核心来产生期望值 |
+| `tests/test_gprbf.py` | 基线必要测试；**独立参考**（Gauss-Jordan 直接逆、独立核函数、独立 logdet、单点显式逆公式、中心差分）不导入被测核心来产生期望值 |
+| `tests/test_joint_samples.py` | 增量测试：满协方差独立核对、重复点完全相关、零噪声训练点、空查询、固定值条件化、经验协方差核对 |
 | `demo.py` | 确定性数据演示：正常结果（含 95% 置信区间）+ 实际触发的 `not_pd` 边界与 `ValueError` 拒绝 |
+| `demo_iteration.py` | 联合抽样演示：相关函数样本、重复点/零噪声/空查询、固定值条件化、不相容拒绝、独立 Gauss-Jordan 核对 |
 
 ## 接口
 
@@ -57,12 +81,57 @@ p = predict(X, y, X_test, hp, *, jitter=0.0)
 # p.status == "not_pd" / "negative_variance" 见下
 ```
 
+### 联合后验与相关函数样本（增量）
+
+```python
+from gprbf import joint_posterior, sample_posterior, Hyperparameters
+
+hp0 = Hyperparameters(alpha=1.2, lengthscale=1.1, noise=0.0)
+Q = [(0.5,), (1.7,), (1.7,), (3.0,)]   # 含两个重复查询点, 最后一个是训练点
+
+post = joint_posterior(X, y, Q, hp0, allow_zero_noise=True)
+# status=ok 时: mean=联合后验均值; covariance=完整后验协方差 C;
+# factor=相关结构因子 F 满足 F F^T = C (重复点因子行逐位相同);
+# rank=数值秩 (重复查询点使 rank < m, 零特征方向保留而非解除);
+# eigenvalues/corrected_eigenvalues 为特征分解审计信息。
+# status=not_pd: 训练协方差无法 Cholesky (不自动加 jitter/噪声);
+# status=not_psd: 后验有超过容差的负特征值, 明确拒绝。
+
+# Z 由调用方提供, 形状 (n_draws, post.rank) 的标准正态数; 本库不读随机种子。
+s = sample_posterior(X, y, Q, hp0, Z, allow_zero_noise=True)
+# status=ok 时 samples=(n_draws, m), 每条样本 = mean + Z F^T;
+# 重复查询坐标逐位相等 (完全相关, 不是逐点独立抽样);
+# 零方差坐标 (零噪声训练点) 恒为后验均值。
+# Z 行列数不符 -> status=bad_shape; Z 含 NaN/Inf -> ValueError。
+
+# 固定观测值的路径条件化 (满高斯条件公式):
+s2 = sample_posterior(X, y, Q, hp0, Z2, fixed={0: 0.88},
+                      allow_zero_noise=True)
+# 条件系统只在非零协方差子空间用截断谱伪逆求解:
+#   mean_cond = mean + C_{,I} C_I^+ (v - mean_I)
+#   C_cond    = C - C_{,I} C_I^+ C_{I,}
+# 不相容的零方差观测 (给重复点两个不同值, 或给零方差训练点矛盾值)
+# -> status=incompatible_fixed 明确拒绝, 不返回样本;
+# 相容固定坐标逐位精确保持, 其重复副本同步;
+# Z 列数须等于条件后秩 s2.rank。
+
+# 空查询: m=0, rank=0, Z 为 (n_draws, 0), samples 为长度 n_draws 的空元组。
+empty = sample_posterior(X, y, [], hp0, (), allow_zero_noise=True)
+```
+
+半正定分解口径（`psd_factor` / `jacobi_eigen` 公开可审计）：先对称化，再用循环
+Jacobi 特征分解；特征值小于 `-1e-10*max(1,λmax)` 判为明显非半正定并拒绝；容差内负微量抹零
+并在 `corrected_eigenvalues` 记录（下标, 原始值）；不超过 `1e-12*max(1,λmax)` 的为零特征方向，
+保留秩亏损（重复点完全相关性由此体现），**绝不通过加观测噪声或 jitter 掩盖奇异性**。
+
 结果均为冻结 `dataclass`，字段以 `None`/元组区分成功与失败状态；函数无状态、不修改入参、
 重复调用逐位一致。
 
 ## 输入上限与错误语义
 
-- 训练样本 `1 ≤ n ≤ 80`；输入维数 `1 ≤ d ≤ 3`；预测点上限 10000（防护值，非题面要求）。
+- 训练样本 `1 ≤ n ≤ 80`；输入维数 `1 ≤ d ≤ 3`；逐点 `predict` 预测点上限 10000，
+  联合后验 `joint_posterior`/`sample_posterior` 查询点上限 80（满协方差 m×m、O(m³) 分解）。
+- 联合接口的 `X_test` 允许为空（m=0）；逐点 `predict` 仍要求至少一个查询点。
 - 所有数值输入必须是有限的 `int`/`float`：**NaN、Infinity 一律 `ValueError` 拒绝**，
   错误信息带具体下标（如 `X[3][1]`、`y[2]`）便于定位。
 - **`bool` 显式拒绝**（即使 Python 中 `bool` 是 `int` 子类）；普通整数坐标/目标值合法。
@@ -126,3 +195,8 @@ p = predict(X, y, X_test, hp, *, jitter=0.0)
   `"not_pd"` 状态显式表达（这是“矩阵被证明在此浮点表示下无法分解”，区别于输入非法）。
 - 纯 Python O(n³)，面向 n≤80；更大规模不适用。
 - 预测方差的负微量阈值固定为相对 `max(1, α²)` 的 1e-10。
+- 联合抽样只覆盖隐函数 f* 的高斯后验（可在调用方自行加观测噪声）；样本所需标准正态数
+  完全由调用方按 `rank` 提供，本库不内置 RNG、不读种子配置。条件化仅支持“固定坐标=给定值”
+  的路径（线性高斯条件），不实现一般线性/不等式观测、多保真或在线更新。
+- 秩判定阈值固定为 `1e-12*max(1,λmax)`，负特征值拒绝阈值固定为
+  `1e-10*max(1,λmax)`；零噪声相容观测的零空间容差固定为相对 1e-9。
