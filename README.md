@@ -7,25 +7,41 @@
 
 ```
 k(x, x') = alpha^2 * exp(-||x - x'||^2 / (2 * lengthscale^2))
-K_y      = K(X, X) + (noise^2 + jitter) * I,   alpha / lengthscale / noise > 0
+K_y      = K(X, X) + (noise^2 + jitter) * I,
+# 旧边际似然/逐点预测接口: alpha / lengthscale / noise > 0
+# 联合抽样接口允许 noise = 0, 用于零噪声训练点精确插值
 ```
+
+## 环境准备（隔离 venv，可选但推荐）
+
+```bash
+python3.14 -m venv .venv
+. .venv/bin/activate
+python --version  # 应显示 Python 3.14.7
+```
+
+不激活 venv 时也可直接使用系统 Python 3.14.7。模块只依赖标准库，不需要 `pip install`。
 
 ## 运行命令
 
 ```bash
-python -m unittest discover -s tests -v   # 24 个测试, 实测 < 1 秒
-python demo.py                             # 固定输入演示, 实测约 0.04 秒（上限 8 秒内）
+python -m unittest discover -s tests -v
+python demo.py
+python demo_iteration.py                  # 联合抽样增量演示, 固定输入且 < 90 秒
 ```
 
-无需安装任何依赖（`requirements.txt` 为空占位）；不需要网络、账号、密钥、数据库或 Docker。
+无需安装依赖（`requirements.txt` 为空占位）；不需要网络、账号、密钥、数据库或 Docker。
+所有演示均真实计算确定性输入，不读取随机种子配置、不调用 RNG、不使用 sleep 或预录结果。
 
 ## 文件
 
 | 文件 | 说明 |
 |---|---|
-| `gprbf.py` | 本题库本体：校验、RBF 核、Cholesky、log 边际似然、解析梯度、后验预测 |
-| `tests/test_gprbf.py` | 必要测试；**独立参考**（Gauss-Jordan 直接逆、独立核函数、独立 logdet、单点显式逆公式、中心差分）不导入被测核心来产生期望值 |
+| `gprbf.py` | 题库本体：RBF 核、Cholesky、log 边际似然、解析梯度、后验预测、奇异 PSD 联合抽样 |
+| `tests/test_gprbf.py` | 基线回归；独立参考不调用被测核心产生期望值 |
+| `tests/test_joint_samples.py` | 联合抽样增量：重复查询、零噪声训练点、空查询、固定值条件化、PSD 秩判断 |
 | `demo.py` | 确定性数据演示：正常结果（含 95% 置信区间）+ 实际触发的 `not_pd` 边界与 `ValueError` 拒绝 |
+| `demo_iteration.py` | 联合抽样演示：完整协方差、重复点完全相关、零噪声训练点、固定值、拒绝与空查询 |
 
 ## 接口
 
@@ -57,6 +73,29 @@ p = predict(X, y, X_test, hp, *, jitter=0.0)
 # p.status == "not_pd" / "negative_variance" 见下
 ```
 
+### 联合相关函数抽样
+
+```python
+from gprbf import Hyperparameters, sample_posterior
+
+hp0 = Hyperparameters(alpha=1.2, lengthscale=0.8, noise=0.0)
+r = sample_posterior(
+    X, y, X_test, hp0, standard_normal,
+    jitter=0.0,
+    fixed_values=None,
+)
+```
+
+- `standard_normal` 由调用方提供，形状为 `样本数 × 自由查询点数`；一行对应一次完整函数抽样。
+- 抽样使用 `f = mean + C z`，其中 `C C^T` 是一次性计算的完整后验协方差；重复查询点共享同一随机方向，不逐点独立抽样。
+- 联合抽样入口允许 `noise=0.0`，以支持训练点零噪声精确插值；旧 `log_marginal`/`predict` 仍要求 `noise>0`，接口和状态语义不变。
+- 空 `X_test` 合法：每行 `standard_normal` 也必须为空行，返回相应数量的空样本。
+- `fixed_values={index: value}` 可在已得后验上再条件化；重复坐标必须给同一值，不相容零方差观测返回 `status="incompatible_observation"`。
+- `SampleResult.samples` 为 `(样本, 查询点)` 元组；`covariance` 是固定值条件化后的完整协方差，固定坐标行列为零，样本固定坐标逐位等于输入。
+- 重复点使协方差半正定而非正定：内部使用带秩判断的对称特征分解，允许零特征方向；小负特征值只在相对容差内置零并记录于 `corrected_eigenvalues`。
+- 明显负特征值返回 `status="not_psd"`；不会自动加入观测噪声或 jitter 掩盖问题。
+- 联合抽样显式持有 `m×m` 协方差，查询点上限为 `MAX_JOINT_SAMPLE_POINTS = 80`；旧逐点 `predict` 仍保留 10000 点上限。
+
 结果均为冻结 `dataclass`，字段以 `None`/元组区分成功与失败状态；函数无状态、不修改入参、
 重复调用逐位一致。
 
@@ -66,7 +105,8 @@ p = predict(X, y, X_test, hp, *, jitter=0.0)
 - 所有数值输入必须是有限的 `int`/`float`：**NaN、Infinity 一律 `ValueError` 拒绝**，
   错误信息带具体下标（如 `X[3][1]`、`y[2]`）便于定位。
 - **`bool` 显式拒绝**（即使 Python 中 `bool` 是 `int` 子类）；普通整数坐标/目标值合法。
-- `alpha/lengthscale/noise ≤ 0`、`jitter < 0`、行列数不一致、维度不匹配：`ValueError`；
+- 旧 `log_marginal`/`predict` 中 `alpha/lengthscale/noise ≤ 0` 会拒绝；`sample_posterior` 允许 `noise=0` 但仍拒绝负噪声；
+- `jitter < 0`、行列数不一致、维度不匹配：`ValueError`；
   类型不符（如传元组代替 `Hyperparameters`）：`TypeError`。不做任何静默纠正。
 - 输入先整体校验、后分配计算，批次预测失败不产生部分结果。
 

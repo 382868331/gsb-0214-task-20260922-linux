@@ -23,12 +23,16 @@ __all__ = [
     "MAX_SAMPLES",
     "MAX_DIM",
     "MAX_TEST_POINTS",
+    "MAX_JOINT_SAMPLE_POINTS",
     "NEG_VAR_REL_TOL",
+    "PSD_EIGEN_REL_TOL",
     "Hyperparameters",
     "MarginalResult",
     "Prediction",
+    "SampleResult",
     "log_marginal",
     "predict",
+    "sample_posterior",
     "rbf_kernel",
     "classify_raw_variance",
 ]
@@ -39,6 +43,10 @@ MAX_SAMPLES = 80
 MAX_DIM = 3
 #: 预测点数量的保护性上限（README 中记录的防护，非题面要求）。
 MAX_TEST_POINTS = 10_000
+#: 联合函数抽样需要显式持有完整 m×m 后验协方差；标准库实现限制 m 为 500。
+MAX_JOINT_SAMPLE_POINTS = 80
+#: 半正定矩阵特征值的相对数值容差。
+PSD_EIGEN_REL_TOL = 1e-11
 #: 预测方差负微量判定容差: raw >= -NEG_VAR_REL_TOL * max(1, alpha^2) 视为数值抹零。
 NEG_VAR_REL_TOL = 1e-10
 
@@ -122,6 +130,21 @@ class Prediction:
     jitter: float
 
 
+@dataclass(frozen=True)
+class SampleResult:
+    """联合高斯函数抽样结果；status 非 ok 时计算字段为 None。"""
+
+    status: str
+    samples: Optional[Tuple[Tuple[float, ...], ...]]
+    mean: Optional[Tuple[float, ...]]
+    covariance: Optional[Tuple[Tuple[float, ...], ...]]
+    rank: Optional[int]
+    corrected_eigenvalues: Tuple[float, ...]
+    covariance_residual: Optional[float]
+    effective_noise_variance: float
+    jitter: float
+
+
 # ---------------------------------------------------------------------------
 # 输入校验（错误语义: TypeError 类型错误, ValueError 值非法; 信息带下标可定位）
 # ---------------------------------------------------------------------------
@@ -146,10 +169,15 @@ def _validate_matrix(
     *,
     max_rows: int,
     expect_dim: Optional[int] = None,
+    allow_empty: bool = False,
 ) -> Tuple[Tuple[Tuple[float, ...], ...], int, int]:
     if not isinstance(X, (list, tuple)):
         raise TypeError(f"{name}: expected list/tuple of rows, got {type(X).__name__}")
     if len(X) == 0:
+        if allow_empty:
+            if expect_dim is None:
+                raise ValueError(f"{name}: empty input requires an explicit expected dimension")
+            return (), 0, expect_dim
         raise ValueError(f"{name}: must contain at least one row")
     if len(X) > max_rows:
         raise ValueError(
@@ -189,7 +217,7 @@ def _validate_vector(y, name: str, n: Optional[int] = None) -> Tuple[float, ...]
     return tuple(_finite_float(v, f"{name}[{i}]") for i, v in enumerate(y))
 
 
-def _validate_hp(hp) -> Hyperparameters:
+def _validate_hp(hp, *, allow_zero_noise: bool = False) -> Hyperparameters:
     if not isinstance(hp, Hyperparameters):
         raise TypeError(
             f"hp: expected Hyperparameters, got {type(hp).__name__}"
@@ -201,7 +229,7 @@ def _validate_hp(hp) -> Hyperparameters:
         raise ValueError(f"hp.alpha: must be > 0, got {a!r}")
     if ell <= 0.0:
         raise ValueError(f"hp.lengthscale: must be > 0, got {ell!r}")
-    if s <= 0.0:
+    if s < 0.0 or (s == 0.0 and not allow_zero_noise):
         raise ValueError(f"hp.noise: must be > 0, got {s!r}")
     return Hyperparameters(a, ell, s)
 
@@ -382,15 +410,291 @@ def classify_raw_variance(raw: float, alpha2: float) -> Tuple[float, str]:
     return raw, "ok"
 
 
+def _symmetric_eigensystem(A, sweeps: int = 80):
+    """实对称矩阵的循环 Jacobi 特征分解：A = V diag(w) V^T。"""
+
+    n = len(A)
+    V = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+    W = [list(row) for row in A]
+
+    for _ in range(sweeps):
+        off = 0.0
+        for p in range(n):
+            for q in range(p + 1, n):
+                off = max(off, abs(W[p][q]))
+        if off <= 1e-14:
+            break
+
+        for p in range(n - 1):
+            for q in range(p + 1, n):
+                apq = W[p][q]
+                if abs(apq) <= 1e-15:
+                    continue
+                tau = (W[q][q] - W[p][p]) / (2.0 * apq)
+                if tau >= 0.0:
+                    t = 1.0 / (tau + math.sqrt(1.0 + tau * tau))
+                else:
+                    t = -1.0 / (-tau + math.sqrt(1.0 + tau * tau))
+                c = 1.0 / math.sqrt(1.0 + t * t)
+                s = t * c
+
+                for k in range(n):
+                    wkp = W[k][p]
+                    wkq = W[k][q]
+                    W[k][p] = c * wkp - s * wkq
+                    W[k][q] = s * wkp + c * wkq
+                for k in range(n):
+                    wpk = W[p][k]
+                    wqk = W[q][k]
+                    W[p][k] = c * wpk - s * wqk
+                    W[q][k] = s * wpk + c * wqk
+                for k in range(n):
+                    vkp = V[k][p]
+                    vkq = V[k][q]
+                    V[k][p] = c * vkp - s * vkq
+                    V[k][q] = s * vkp + c * vkq
+
+    values = [W[i][i] for i in range(n)]
+    scale = max([abs(v) for v in values] + [abs(A[i][j]) for i in range(n) for j in range(n)] + [1.0])
+    zero_tol = PSD_EIGEN_REL_TOL * scale
+    rank = sum(1 for v in values if v > zero_tol)
+    residual = _symmetry_residual(W)
+    for i in range(n):
+        residual = max(residual, abs(W[i][i] - values[i]))
+        for j in range(i + 1, n):
+            residual = max(residual, abs(W[i][j]), abs(W[j][i]))
+    return tuple(values), V, rank, zero_tol, residual
+
+
+def _psd_factor(A):
+    """
+    返回 (eigenvalues, vectors, rank, corrected, residual)。
+
+    秩内特征向量构成平方根 C = V_r diag(sqrt(lambda_r)) (...)^T；
+    零特征方向原样保留。明显负特征值返回 None。
+    """
+
+    n = len(A)
+    if n == 0:
+        return (), (), 0, (), 0.0
+
+    values, V, rank, zero_tol, residual = _symmetric_eigensystem(A)
+    corrected = []
+    for i, value in enumerate(values):
+        if value < 0.0:
+            if value < -zero_tol:
+                return None
+            corrected.append(value)
+            values = list(values)
+            values[i] = 0.0
+            values = tuple(values)
+
+    reconstructed = _factor_covariance(V, values, rank)
+    residual = max(residual, max(
+        abs(reconstructed[i][j] - A[i][j]) for i in range(n) for j in range(n)
+    ))
+    return tuple(values), V, rank, tuple(corrected), residual
+
+
+def _factor_covariance(V, values, rank):
+    positive = [i for i, value in enumerate(values) if value > 0.0]
+    positive = positive[:rank] if rank < len(positive) else positive
+    n = len(V)
+    C = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            total = 0.0
+            for q in positive:
+                total += V[i][q] * V[j][q] * values[q]
+            C[i][j] = total
+    return C
+
+
+def _factor_transform(V, values, rank, Z):
+    positive = [i for i, value in enumerate(values) if value > 0.0]
+    positive = positive[:rank] if rank < len(positive) else positive
+    scales = [math.sqrt(values[i]) for i in positive]
+    out = []
+    for zrow in Z:
+        row = []
+        for i in range(len(V)):
+            total = 0.0
+            for col, q in enumerate(positive):
+                total += V[i][q] * scales[col] * zrow[col]
+            row.append(total)
+        out.append(tuple(row))
+    return tuple(out)
+
+
+def _psd_pseudoinverse(values, V, rank):
+    positive = [i for i, value in enumerate(values) if value > 0.0][:rank]
+    n = len(V)
+    inv = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            inv[i][j] = sum(V[i][q] * V[j][q] / values[q] for q in positive)
+    return inv
+
+
+def _null_residual(values, V, rank, vector):
+    positive = {i for i, value in enumerate(values) if value > 0.0}
+    positive = set(sorted(positive)[:rank])
+    result = 0.0
+    n = len(V)
+    for q, value in enumerate(values):
+        if q in positive:
+            continue
+        coefficient = sum(V[i][q] * vector[i] for i in range(n))
+        result = max(result, abs(coefficient))
+    return result
+
+
+def _validate_standard_matrix(Z, name, rows: Optional[int], cols: int):
+    if not isinstance(Z, (list, tuple)):
+        raise TypeError(f"{name}: expected list/tuple rows, got {type(Z).__name__}")
+    out = []
+    for i, row in enumerate(Z):
+        if not isinstance(row, (list, tuple)):
+            raise TypeError(f"{name}[{i}]: expected list/tuple row")
+        if len(row) != cols:
+            raise ValueError(
+                f"{name}[{i}]: length {len(row)} != number of query points {cols}"
+            )
+        out.append(tuple(_finite_float(v, f"{name}[{i}][{j}]") for j, v in enumerate(row)))
+    if rows is not None and len(out) != rows:
+        raise ValueError(f"{name}: expected {rows} rows, got {len(out)}")
+    return tuple(out)
+
+
+def _validate_fixed_values(fixed_values, m: int):
+    if fixed_values is None:
+        return {}
+    if not isinstance(fixed_values, dict):
+        raise TypeError("fixed_values: expected dict {index: value}")
+    result = {}
+    for key, value in fixed_values.items():
+        if isinstance(key, bool) or not isinstance(key, int):
+            raise TypeError(f"fixed_values key {key!r}: expected int")
+        if not 0 <= key < m:
+            raise ValueError(f"fixed_values key {key}: outside 0..{m - 1}")
+        result[key] = _finite_float(value, f"fixed_values[{key}]")
+    return result
+
+
+def _posterior_with_singular_training(Xv, yv, Xt, hpv, var):
+    n = len(Xv)
+    K, _ = _kernel_and_d2(Xv, hpv)
+    Ky = [row[:] for row in K]
+    for i in range(n):
+        Ky[i][i] += var
+    training = _psd_factor(Ky)
+    if training is None:
+        return None
+    values, V, rank, corrected, residual = training
+    mismatch = _null_residual(values, V, rank, yv)
+    scale = max([1.0] + [abs(Ky[i][j]) for i in range(n) for j in range(n)])
+    if mismatch > PSD_EIGEN_REL_TOL * scale:
+        return "incompatible_observation"
+
+    K_inv = _psd_pseudoinverse(values, V, rank)
+    Ks = _cross_kernel(Xv, Xt, hpv) if Xt else []
+    Ktt, _ = _kernel_and_d2(Xt, hpv) if Xt else ([], [])
+    m = len(Xt)
+    mean = []
+    for t in range(m):
+        mean.append(sum(Ks[i][t] * sum(K_inv[i][j] * yv[j] for j in range(n)) for i in range(n)))
+    cov = []
+    for t in range(m):
+        row = []
+        for u in range(m):
+            reduction = sum(
+                Ks[i][t] * sum(K_inv[i][j] * Ks[j][u] for j in range(n))
+                for i in range(n)
+            )
+            value = Ktt[t][u] - reduction
+            if u > t:
+                mirror = Ktt[u][t] - sum(
+                    Ks[i][u] * sum(K_inv[i][j] * Ks[j][t] for j in range(n))
+                    for i in range(n)
+                )
+                value = 0.5 * (value + mirror)
+            elif u < t:
+                value = cov[u][t]
+            row.append(value)
+        cov.append(row)
+    return mean, cov, corrected, residual
+
+
+def _condition_factorized(mean, values, V, rank, fixed):
+    n = len(V)
+    fixed_idx = tuple(sorted(fixed))
+    fixed_set = set(fixed_idx)
+    free_idx = tuple(i for i in range(n) if i not in fixed_set)
+    positive = [q for q, value in enumerate(values) if value > 0.0][:rank]
+    U = [[V[i][q] * math.sqrt(values[q]) for q in positive] for i in range(n)]
+
+    if not fixed_idx:
+        free_cov = [
+            [sum(U[i][q] * U[j][q] for q in range(len(positive))) for j in free_idx]
+            for i in free_idx
+        ]
+        return tuple(mean), free_cov, free_idx, (), 0.0
+
+    E = [[U[i][q] for q in range(len(positive))] for i in fixed_idx]
+    B = [
+        [sum(E[a][q] * E[c][q] for q in range(len(positive))) for c in range(len(fixed_idx))]
+        for a in range(len(fixed_idx))
+    ]
+    bfact = _psd_factor(B)
+    if bfact is None:
+        return None
+    bvalues, bV, brank, bcorrected, bresidual = bfact
+    delta = [fixed[i] - mean[i] for i in fixed_idx]
+    mismatch = _null_residual(bvalues, bV, brank, delta)
+    scale = max([1.0] + [abs(B[i][j]) for i in range(len(B)) for j in range(len(B))])
+    if mismatch > PSD_EIGEN_REL_TOL * scale:
+        raise FloatingPointError("incompatible zero-variance observation")
+    B_inv = _psd_pseudoinverse(bvalues, bV, brank)
+    rvec = []
+    for q in range(len(positive)):
+        rvec.append(sum(
+            E[a][q] * sum(B_inv[a][c] * delta[c] for c in range(len(fixed_idx)))
+            for a in range(len(fixed_idx))
+        ))
+    shifted = [mean[i] + sum(U[i][q] * rvec[q] for q in range(len(positive))) for i in range(n)]
+
+    projector = [[0.0] * len(positive) for _ in range(len(positive))]
+    for q in range(len(positive)):
+        projector[q][q] = 1.0
+    for q in range(len(positive)):
+        for p in range(len(positive)):
+            adjustment = sum(
+                E[a][q] * sum(B_inv[a][c] * E[c][p] for c in range(len(fixed_idx)))
+                for a in range(len(fixed_idx))
+            )
+            projector[q][p] -= adjustment
+    free_cov = []
+    for ii, i in enumerate(free_idx):
+        row = []
+        for jj, j in enumerate(free_idx):
+            total = 0.0
+            for q in range(len(positive)):
+                for p in range(len(positive)):
+                    total += U[i][q] * projector[q][p] * U[j][p]
+            row.append(total)
+        free_cov.append(row)
+    return tuple(shifted[i] for i in free_idx), free_cov, free_idx, bcorrected, bresidual
+
+
 # ---------------------------------------------------------------------------
 # 核心接口
 # ---------------------------------------------------------------------------
 
 
-def _prepare_training(X, y, hp, jitter):
+def _prepare_training(X, y, hp, jitter, *, allow_zero_noise: bool = False):
     Xv, n, _d = _validate_matrix(X, "X", max_rows=MAX_SAMPLES)
     yv = _validate_vector(y, "y", n)
-    hpv = _validate_hp(hp)
+    hpv = _validate_hp(hp, allow_zero_noise=allow_zero_noise)
     jv = _validate_jitter(jitter)
     return Xv, yv, hpv, jv, hpv.noise * hpv.noise + jv
 
@@ -573,6 +877,151 @@ def predict(
         clamped=tuple(clamped),
         symmetry_residual=sym,
         solve_residual=solve_res,
+        effective_noise_variance=var,
+        jitter=jv,
+    )
+
+
+def sample_posterior(
+    X,
+    y,
+    X_test,
+    hp,
+    standard_normal,
+    *,
+    jitter: float = 0.0,
+    fixed_values: Optional[dict] = None,
+) -> SampleResult:
+    """
+    一次抽出整条相关隐函数样本：f = mean + C Z^T，C C^T 是完整后验协方差。
+
+    standard_normal 的一行对应一个样本，列数等于未固定查询点数；本函数不读取
+    任何随机种子或全局 RNG。重复查询点产生半正定奇异协方差时，使用带秩判断
+    的 Jacobi 特征分解；小负特征值只在相对容差内修正到 0 并记录，不添加噪声。
+    """
+
+    allow_zero_noise = True
+    Xv, n, dim = _validate_matrix(X, "X", max_rows=MAX_SAMPLES)
+    yv = _validate_vector(y, "y", n)
+    hpv = _validate_hp(hp, allow_zero_noise=allow_zero_noise)
+    jv = _validate_jitter(jitter)
+    var = hpv.noise * hpv.noise + jv
+    Xt, m, _ = _validate_matrix(
+        X_test,
+        "X_test",
+        max_rows=MAX_JOINT_SAMPLE_POINTS,
+        expect_dim=dim,
+        allow_empty=True,
+    )
+    fixed = _validate_fixed_values(fixed_values, m)
+
+    if m == 0:
+        if fixed:
+            raise ValueError("fixed_values: cannot index an empty query")
+        zrows = _validate_standard_matrix(standard_normal, "standard_normal", None, 0)
+        return SampleResult(
+            status="ok",
+            samples=tuple(() for _ in zrows),
+            mean=(),
+            covariance=(),
+            rank=0,
+            corrected_eigenvalues=(),
+            covariance_residual=0.0,
+            effective_noise_variance=var,
+            jitter=jv,
+        )
+
+    posterior = _posterior_with_singular_training(Xv, yv, Xt, hpv, var)
+    if posterior is None:
+        return SampleResult(
+            status="not_psd", samples=None, mean=None, covariance=None, rank=None,
+            corrected_eigenvalues=(), covariance_residual=None,
+            effective_noise_variance=var, jitter=jv,
+        )
+    if posterior == "incompatible_observation":
+        return SampleResult(
+            status="incompatible_observation", samples=None, mean=None,
+            covariance=None, rank=None, corrected_eigenvalues=(),
+            covariance_residual=None, effective_noise_variance=var, jitter=jv,
+        )
+    prior_mean, prior_cov, train_corrected, train_residual = posterior
+    exact_values = {}
+    train_by_point = {Xv[i]: yv[i] for i in range(n)}
+    for t in range(m):
+        if Xt[t] in train_by_point:
+            exact_value = train_by_point[Xt[t]]
+            prior_mean[t] = exact_value
+            exact_values[t] = exact_value
+
+    fact = _psd_factor(prior_cov)
+    if fact is None:
+        return SampleResult(
+            status="not_psd", samples=None, mean=None, covariance=None, rank=None,
+            corrected_eigenvalues=tuple(train_corrected), covariance_residual=None,
+            effective_noise_variance=var, jitter=jv,
+        )
+    values, V, rank, query_corrected, query_residual = fact
+
+    try:
+        cond_mean, cond_cov, free_idx, fixed_corrected, fixed_residual = _condition_factorized(
+            prior_mean, values, V, rank, fixed
+        )
+    except FloatingPointError:
+        return SampleResult(
+            status="incompatible_observation",
+            samples=None, mean=None, covariance=None, rank=None,
+            corrected_eigenvalues=tuple(train_corrected) + tuple(query_corrected),
+            covariance_residual=None, effective_noise_variance=var, jitter=jv,
+        )
+
+    free_fact = _psd_factor(cond_cov)
+    if free_fact is None:
+        return SampleResult(
+            status="not_psd", samples=None, mean=None, covariance=None, rank=None,
+            corrected_eigenvalues=(
+            tuple(train_corrected) + tuple(query_corrected) + tuple(fixed_corrected),
+            ),
+            covariance_residual=None, effective_noise_variance=var, jitter=jv,
+        )
+    free_values, free_V, free_rank, cond_corrected, cond_residual = free_fact
+    zrows = _validate_standard_matrix(
+        standard_normal, "standard_normal", None, len(free_idx)
+    )
+    free_noise = _factor_transform(free_V, free_values, free_rank, zrows)
+
+    samples = []
+    for row_noise in free_noise:
+        sample = [0.0] * m
+        for position, query_index in enumerate(free_idx):
+            sample[query_index] = cond_mean[position] + row_noise[position]
+        for query_index, value in fixed.items():
+            sample[query_index] = value
+        samples.append(tuple(sample))
+
+    full_mean = [0.0] * m
+    full_cov = [[0.0] * m for _ in range(m)]
+    for position, query_index in enumerate(free_idx):
+        full_mean[query_index] = cond_mean[position]
+        for other_position, other_index in enumerate(free_idx):
+            full_cov[query_index][other_index] = cond_cov[position][other_position]
+    for query_index, value in fixed.items():
+        full_mean[query_index] = value
+    for query_index, value in exact_values.items():
+        if query_index not in fixed:
+            full_mean[query_index] = value
+    residual = max(
+        train_residual, query_residual, fixed_residual, cond_residual,
+        _symmetry_residual(prior_cov), _symmetry_residual(full_cov),
+    )
+    all_corrected = tuple(train_corrected) + tuple(query_corrected) + tuple(fixed_corrected) + tuple(cond_corrected)
+    return SampleResult(
+        status="ok",
+        samples=tuple(samples),
+        mean=tuple(full_mean),
+        covariance=tuple(tuple(row) for row in full_cov),
+        rank=free_rank,
+        corrected_eigenvalues=all_corrected,
+        covariance_residual=residual,
         effective_noise_variance=var,
         jitter=jv,
     )
